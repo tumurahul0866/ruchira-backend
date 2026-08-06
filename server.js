@@ -477,9 +477,13 @@ async function writeProducts(nextProducts) {
     try {
       await ensureDatabase();
       await pool.query('BEGIN');
-      await pool.query('DELETE FROM products');
       for (const product of nextProducts) {
-        await pool.query(productInsertQuery, productRowParams(product));
+        try {
+          await pool.query(productInsertQuery, productRowParams(product));
+        } catch (err) {
+          console.error('writeProducts: failed upserting product', product.id || product.name, err && err.stack ? err.stack : err);
+          throw err;
+        }
       }
       await pool.query('COMMIT');
       return nextProducts;
@@ -489,7 +493,7 @@ async function writeProducts(nextProducts) {
       } catch {
         // ignore rollback failure
       }
-      console.warn('Database write failed, using local products file instead:', error.message);
+      console.warn('Database write failed, using local products file instead:', error && error.stack ? error.stack : error.message);
     }
   }
 
