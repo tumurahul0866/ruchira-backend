@@ -993,7 +993,19 @@ app.post('/api/products', async (req, res) => {
 
     products.push(nextProduct);
     await writeProducts(products);
-    res.json(nextProduct);
+
+    // Check whether product exists in Postgres (helpful for debugging distributed instances)
+    let persistedTo = 'file';
+    if (isPostgresEnabled && pool) {
+      try {
+        const { rows } = await pool.query('SELECT id FROM products WHERE id = $1', [nextProduct.id]);
+        if (rows && rows.length > 0) persistedTo = 'postgres';
+      } catch (err) {
+        console.warn('Postgres persistence check failed:', err && err.message ? err.message : err);
+      }
+    }
+
+    res.json({ ...nextProduct, _persistedTo: persistedTo });
   } catch (error) {
     console.error('Failed to create product:', error);
     res.status(500).json({ error: 'Unable to create product.' });
