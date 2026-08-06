@@ -50,6 +50,8 @@ const PRODUCT_COLUMNS = [
   'name',
   'category',
   'product_type',
+  'quantity_type',
+  'price_per_unit',
   'weights',
   'spice_level',
   'description',
@@ -75,6 +77,8 @@ const productInsertQuery = `
     name = EXCLUDED.name,
     category = EXCLUDED.category,
     product_type = EXCLUDED.product_type,
+    quantity_type = EXCLUDED.quantity_type,
+    price_per_unit = EXCLUDED.price_per_unit,
     weights = EXCLUDED.weights,
     spice_level = EXCLUDED.spice_level,
     description = EXCLUDED.description,
@@ -111,6 +115,8 @@ function normalizeProduct(product) {
     name: product.name,
     category: product.category,
     productType: product.productType ?? product.product_type,
+    quantityType: product.quantityType ?? product.quantity_type ?? 'Weight',
+    pricePerUnit: Number(product.pricePerUnit ?? product.price_per_unit) || (Array.isArray(weights) && weights[0] ? Number(weights[0].price) : 0),
     weights: Array.isArray(weights) ? weights : [],
     spiceLevel: product.spiceLevel ?? product.spice_level,
     description: product.description,
@@ -133,6 +139,8 @@ function normalizeProduct(product) {
 function normalizeProductInput(item) {
   return {
     ...item,
+    quantityType: item.quantityType ?? item.quantity_type ?? 'Weight',
+    pricePerUnit: Number(item.pricePerUnit ?? item.price_per_unit) || 0,
     weights: Array.isArray(item.weights) ? item.weights : [],
     additionalImages: Array.isArray(item.additionalImages) ? item.additionalImages : [],
   };
@@ -187,6 +195,8 @@ function productRowParams(product) {
     product.name,
     product.category,
     product.productType,
+    product.quantityType,
+    product.pricePerUnit,
     normalizeJsonColumn(product.weights),
     product.spiceLevel,
     product.description,
@@ -249,6 +259,8 @@ async function ensureDatabase() {
       name TEXT NOT NULL,
       category TEXT,
       product_type TEXT,
+      quantity_type TEXT,
+      price_per_unit NUMERIC,
       weights JSONB,
       spice_level TEXT,
       description TEXT,
@@ -266,6 +278,14 @@ async function ensureDatabase() {
       image TEXT,
       additional_images JSONB
     );
+  `);
+
+  await pool.query(`
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS quantity_type TEXT;
+  `);
+
+  await pool.query(`
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS price_per_unit NUMERIC;
   `);
 
   await pool.query(`

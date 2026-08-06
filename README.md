@@ -36,9 +36,9 @@ node backend/server.js
 6. Choose Node runtime (18+).
 7. Deploy and monitor logs. You should see `Connected to PostgreSQL via DATABASE_URL`.
 
-## Vercel frontend
+## Render frontend
 
-- Keep frontend on Vercel. Update the frontend API base URL to your deployed backend (e.g., `https://your-backend.onrender.com`). Ensure CORS allows your frontend domain (the server uses `cors()` by default).
+- Keep frontend on Vercel or any hosted frontend. Update the frontend API base URL to your deployed backend (e.g., `https://ruchira-backend-kv3q.onrender.com`). Ensure CORS allows your frontend domain (the server uses `cors()` by default).
 
 ## Smoke test (optional)
 
