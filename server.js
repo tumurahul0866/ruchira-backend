@@ -948,7 +948,7 @@ app.get('/api/products', async (_req, res) => {
     const products = await readProducts();
     res.json(products);
   } catch (error) {
-    console.error('Failed to read products:', error);
+    console.error('Failed to read products:', error && error.stack ? error.stack : error);
     res.status(500).json({ error: 'Unable to read products.' });
   }
 });
