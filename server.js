@@ -85,28 +85,60 @@ const productInsertQuery = `
     additional_images = EXCLUDED.additional_images;
 `;
 
-function normalizeProductRow(row) {
+function normalizeProduct(product) {
   return {
-    id: row.id,
-    name: row.name,
-    category: row.category,
-    productType: row.product_type,
-    weights: row.weights || [],
-    spiceLevel: row.spice_level,
-    description: row.description,
-    ingredients: row.ingredients,
-    shelfLife: row.shelf_life,
-    discountPrice: Number(row.discount_price) || 0,
-    bulkPrice: Number(row.bulk_price) || 0,
-    stockQuantity: Number(row.stock_quantity) || 0,
-    inStock: row.in_stock,
-    bestSeller: row.best_seller,
-    newArrival: row.new_arrival,
-    visible: row.visible,
-    rating: Number(row.rating) || 0,
-    reviewsCount: Number(row.reviews_count) || 0,
-    image: row.image,
-    additionalImages: row.additional_images || [],
+    id: product.id,
+    name: product.name,
+    category: product.category,
+    productType: product.productType ?? product.product_type,
+    weights: Array.isArray(product.weights) ? product.weights : [],
+    spiceLevel: product.spiceLevel ?? product.spice_level,
+    description: product.description,
+    ingredients: product.ingredients,
+    shelfLife: product.shelfLife ?? product.shelf_life,
+    discountPrice: Number(product.discountPrice ?? product.discount_price) || 0,
+    bulkPrice: Number(product.bulkPrice ?? product.bulk_price) || 0,
+    stockQuantity: Number(product.stockQuantity ?? product.stock_quantity) || 0,
+    inStock: product.inStock ?? product.in_stock,
+    bestSeller: product.bestSeller ?? product.best_seller,
+    newArrival: product.newArrival ?? product.new_arrival,
+    visible: product.visible,
+    rating: Number(product.rating) || 0,
+    reviewsCount: Number(product.reviewsCount ?? product.reviews_count) || 0,
+    image: product.image,
+    additionalImages: Array.isArray(product.additionalImages)
+      ? product.additionalImages
+      : product.additional_images || [],
+  };
+}
+
+function normalizeProductInput(item) {
+  return {
+    ...item,
+    weights: Array.isArray(item.weights) ? item.weights : [],
+    additionalImages: Array.isArray(item.additionalImages) ? item.additionalImages : [],
+  };
+}
+
+function normalizeOrderItem(item) {
+  const parsedItem = deepParseJsonValue(item);
+  const product = deepParseJsonValue(parsedItem?.product);
+  return {
+    ...parsedItem,
+    product: typeof product === 'string' ? { name: product } : product || {},
+    quantity: Number(parsedItem?.quantity) || 1,
+  };
+}
+
+function normalizeOrderPayload(order) {
+  const parsedOrder = deepParseJsonValue(order);
+  const customer = deepParseJsonValue(parsedOrder?.customer);
+  const items = deepParseJsonValue(parsedOrder?.items);
+
+  return {
+    ...parsedOrder,
+    customer: typeof customer === 'string' ? { name: customer } : customer || {},
+    items: Array.isArray(items) ? items.map(normalizeOrderItem) : [],
   };
 }
 
@@ -340,12 +372,13 @@ async function readProducts() {
   if (isPostgresEnabled && pool) {
     await ensureDatabase();
     const { rows } = await pool.query('SELECT * FROM products ORDER BY name');
-    return rows.map(normalizeProductRow);
+    return rows.map(normalizeProduct);
   }
 
   await ensureStore();
   const raw = await fs.readFile(productsFile, 'utf8');
-  return JSON.parse(raw);
+  const products = JSON.parse(raw);
+  return Array.isArray(products) ? products.map(normalizeProduct) : [];
 }
 
 async function writeProducts(nextProducts) {
@@ -366,8 +399,9 @@ async function writeProducts(nextProducts) {
   }
 
   await ensureStore();
-  await fs.writeFile(productsFile, JSON.stringify(nextProducts, null, 2), 'utf8');
-  return nextProducts;
+  const normalizedProducts = nextProducts.map(normalizeProduct);
+  await fs.writeFile(productsFile, JSON.stringify(normalizedProducts, null, 2), 'utf8');
+  return normalizedProducts;
 }
 
 async function ensureJsonFile(filePath, defaultValue) {
@@ -418,6 +452,20 @@ async function readOrders() {
   return readJsonFile(ordersFile, defaultOrders);
 }
 
+function deepParseJsonValue(value) {
+  let result = value;
+  while (typeof result === 'string') {
+    try {
+      const parsed = JSON.parse(result);
+      if (parsed === result) break;
+      result = parsed;
+    } catch {
+      break;
+    }
+  }
+  return result;
+}
+
 async function writeOrders(nextOrders) {
   if (isPostgresEnabled && pool) {
     await ensureDatabase();
@@ -425,6 +473,19 @@ async function writeOrders(nextOrders) {
     try {
       await pool.query('DELETE FROM orders');
       for (const order of nextOrders) {
+        const customerValue = deepParseJsonValue(order.customer || {});
+        const itemsValue = deepParseJsonValue(order.items || []);
+        const customerJson = JSON.stringify(customerValue);
+        const itemsJson = JSON.stringify(itemsValue);
+        console.log('writeOrders order payload:', {
+          id: order.id,
+          customerType: typeof customerValue,
+          customerJson,
+          itemsType: typeof itemsValue,
+          itemsJson,
+          itemsValueSample: Array.isArray(itemsValue) ? itemsValue.slice(0, 1) : itemsValue,
+        });
+
         await pool.query(
           `INSERT INTO orders (id, date, status, payment_status, payment_method, total_amount, tracking_number, customer, items)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
@@ -436,9 +497,8 @@ async function writeOrders(nextOrders) {
             order.paymentMethod,
             order.totalAmount,
             order.trackingNumber,
-            // pass objects/arrays directly for pg to serialize to JSONB
-            order.customer || {},
-            order.items || [],
+            customerJson,
+            itemsJson,
           ]
         );
       }
@@ -797,7 +857,7 @@ app.post('/api/products', async (req, res) => {
 
     const products = await readProducts();
     const nextProduct = {
-      ...product,
+      ...normalizeProductInput(product),
       id: product.id || Date.now().toString(),
       visible: product.visible !== undefined ? product.visible : true,
       inStock: product.inStock !== undefined ? product.inStock : Number(product.stockQuantity) > 0,
@@ -815,7 +875,7 @@ app.post('/api/products', async (req, res) => {
 
 app.put('/api/products/:id', async (req, res) => {
   try {
-    const productUpdates = req.body || {};
+    const productUpdates = normalizeProductInput(req.body || {});
     const products = await readProducts();
     const index = products.findIndex((item) => item.id === req.params.id);
     if (index < 0) {
@@ -863,7 +923,9 @@ app.get('/api/orders', async (_req, res) => {
 
 app.post('/api/orders', async (req, res) => {
   try {
-    const order = req.body || {};
+    console.log('Received order body:', req.body);
+    const order = normalizeOrderPayload(req.body || {});
+    console.log('Normalized order payload:', order);
     if (!order.customer || !order.items || !Array.isArray(order.items)) {
       return res.status(400).json({ error: 'Order must include customer and items.' });
     }
@@ -884,6 +946,7 @@ app.post('/api/orders', async (req, res) => {
     res.json(nextOrder);
   } catch (error) {
     console.error('Failed to create order:', error);
+    console.error('Request body:', req.body);
     res.status(500).json({ error: 'Unable to create order.' });
   }
 });
