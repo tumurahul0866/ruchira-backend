@@ -562,6 +562,7 @@ async function readOrders() {
     try {
       await ensureDatabase();
       const { rows } = await pool.query('SELECT * FROM orders ORDER BY date DESC');
+      console.log('readOrders: retrieved', rows.length, 'rows from Postgres');
       return rows.map((row) => ({
         id: row.id,
         date: row.date,
@@ -574,7 +575,7 @@ async function readOrders() {
         items: row.items || [],
       }));
     } catch (error) {
-      console.warn('Falling back to local orders file:', error.message);
+      console.warn('Falling back to local orders file:', error && error.stack ? error.stack : error.message);
     }
   }
   return readJsonFile(ordersFile, defaultOrders);
@@ -1048,7 +1049,7 @@ app.get('/api/orders', async (_req, res) => {
     const orders = await readOrders();
     res.json(orders);
   } catch (error) {
-    console.error('Failed to read orders:', error);
+    console.error('Failed to read orders:', error && error.stack ? error.stack : error);
     res.status(500).json({ error: 'Unable to read orders.' });
   }
 });
