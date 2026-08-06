@@ -476,23 +476,18 @@ async function writeProducts(nextProducts) {
   if (isPostgresEnabled && pool) {
     try {
       await ensureDatabase();
-      await pool.query('BEGIN');
+      // Upsert each product individually; do not use a transaction so one failure
+      // doesn't abort the entire batch. Log per-row failures and continue.
       for (const product of nextProducts) {
         try {
           await pool.query(productInsertQuery, productRowParams(product));
         } catch (err) {
           console.error('writeProducts: failed upserting product', product.id || product.name, err && err.stack ? err.stack : err);
-          throw err;
+          // continue to next product instead of throwing to avoid wiping DB
         }
       }
-      await pool.query('COMMIT');
       return nextProducts;
     } catch (error) {
-      try {
-        await pool.query('ROLLBACK');
-      } catch {
-        // ignore rollback failure
-      }
       console.warn('Database write failed, using local products file instead:', error && error.stack ? error.stack : error.message);
     }
   }
