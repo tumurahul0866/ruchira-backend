@@ -214,18 +214,13 @@ async function seedProductsFromJsonFile() {
       return;
     }
 
-    const seedIds = seedProducts.map((product) => product.id).filter(Boolean);
-    const existingRows = await pool.query('SELECT id FROM products');
-    const existingIds = new Set(existingRows.rows.map((row) => row.id));
-    const hasAllSeedProducts = seedIds.every((id) => existingIds.has(id));
-
-    if (hasAllSeedProducts) {
-      return;
-    }
-
-    await pool.query('DELETE FROM products');
+    // Upsert each seed product so we don't erase admin-created products
     for (const product of seedProducts) {
-      await pool.query(productInsertQuery, productRowParams(normalizeProduct(product)));
+      try {
+        await pool.query(productInsertQuery, productRowParams(normalizeProduct(product)));
+      } catch (err) {
+        console.warn('Unable to upsert seed product:', product.id || product.name, err && err.message ? err.message : err);
+      }
     }
   } catch (error) {
     console.warn('Unable to seed products from data/products.json:', error.message);
