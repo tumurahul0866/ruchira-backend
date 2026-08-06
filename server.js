@@ -2,6 +2,7 @@ import dotenv from 'dotenv';
 import express from 'express';
 import cors from 'cors';
 import { promises as fs } from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import pg from 'pg';
@@ -11,7 +12,14 @@ const __dirname = path.dirname(__filename);
 
 dotenv.config({ path: path.join(__dirname, '.env') });
 
-const dataDir = path.join(__dirname, '..', 'data');
+const isVercel =
+  process.env.VERCEL === '1' ||
+  process.env.VERCEL === 'true' ||
+  Boolean(process.env.VERCEL_ENV) ||
+  Boolean(process.env.NOW_REGION);
+const dataDir = isVercel
+  ? path.join(os.tmpdir(), 'vasuki-data')
+  : path.join(__dirname, '..', 'data');
 const dataFile = path.join(dataDir, 'admin-settings.json');
 const productsFile = path.join(dataDir, 'products.json');
 const ordersFile = path.join(dataDir, 'orders.json');
@@ -85,13 +93,25 @@ const productInsertQuery = `
     additional_images = EXCLUDED.additional_images;
 `;
 
+function parseJsonValue(value) {
+  if (typeof value !== 'string') return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
 function normalizeProduct(product) {
+  const weights = parseJsonValue(product.weights);
+  const additionalImages = parseJsonValue(product.additionalImages ?? product.additional_images);
+
   return {
     id: product.id,
     name: product.name,
     category: product.category,
     productType: product.productType ?? product.product_type,
-    weights: Array.isArray(product.weights) ? product.weights : [],
+    weights: Array.isArray(weights) ? weights : [],
     spiceLevel: product.spiceLevel ?? product.spice_level,
     description: product.description,
     ingredients: product.ingredients,
@@ -106,9 +126,7 @@ function normalizeProduct(product) {
     rating: Number(product.rating) || 0,
     reviewsCount: Number(product.reviewsCount ?? product.reviews_count) || 0,
     image: product.image,
-    additionalImages: Array.isArray(product.additionalImages)
-      ? product.additionalImages
-      : product.additional_images || [],
+    additionalImages: Array.isArray(additionalImages) ? additionalImages : [],
   };
 }
 
@@ -143,20 +161,21 @@ function normalizeOrderPayload(order) {
 }
 
 function productRowParams(product) {
-  const deepParseMaybeString = (value) => {
-    if (typeof value !== 'string') return value;
-    try {
-      const parsed = JSON.parse(value);
-      // if parsing yields another string, try again recursively
-      return deepParseMaybeString(parsed);
-    } catch {
-      return value;
+  const serializeJson = (value) => {
+    if (value == null) return null;
+    if (typeof value === 'string') {
+      try {
+        return JSON.parse(value);
+      } catch {
+        return value;
+      }
     }
+    return value;
   };
 
   const normalizeArray = (arr) => {
     if (!Array.isArray(arr)) return [];
-    return arr.map((item) => deepParseMaybeString(item));
+    return arr.map((item) => serializeJson(item));
   };
 
   return [
@@ -164,7 +183,6 @@ function productRowParams(product) {
     product.name,
     product.category,
     product.productType,
-    // pass arrays/objects directly so pg can serialize them to JSONB
     normalizeArray(product.weights),
     product.spiceLevel,
     product.description,
@@ -182,6 +200,36 @@ function productRowParams(product) {
     product.image,
     normalizeArray(product.additionalImages),
   ];
+}
+
+async function seedProductsFromJsonFile() {
+  if (!pool) return;
+
+  try {
+    const raw = await fs.readFile(productsFile, 'utf8');
+    const parsed = JSON.parse(raw);
+    const seedProducts = Array.isArray(parsed) ? parsed : [];
+
+    if (seedProducts.length === 0) {
+      return;
+    }
+
+    const seedIds = seedProducts.map((product) => product.id).filter(Boolean);
+    const existingRows = await pool.query('SELECT id FROM products');
+    const existingIds = new Set(existingRows.rows.map((row) => row.id));
+    const hasAllSeedProducts = seedIds.every((id) => existingIds.has(id));
+
+    if (hasAllSeedProducts) {
+      return;
+    }
+
+    await pool.query('DELETE FROM products');
+    for (const product of seedProducts) {
+      await pool.query(productInsertQuery, productRowParams(normalizeProduct(product)));
+    }
+  } catch (error) {
+    console.warn('Unable to seed products from data/products.json:', error.message);
+  }
 }
 
 async function ensureDatabase() {
@@ -310,6 +358,13 @@ async function ensureDatabase() {
       [defaultCredentials.email, defaultCredentials.password]
     );
   }
+
+  await seedProductsFromJsonFile();
+}
+
+async function ensureDataDirectory() {
+  await fs.mkdir(dataDir, { recursive: true });
+  console.log('Using JSON data store at:', dataDir);
 }
 
 async function ensureStore() {
@@ -318,19 +373,24 @@ async function ensureStore() {
     return;
   }
 
-  await fs.mkdir(dataDir, { recursive: true });
-
-  try {
-    await fs.access(dataFile);
-  } catch {
-    await fs.writeFile(dataFile, JSON.stringify(defaultCredentials, null, 2), 'utf8');
-  }
+  await ensureDataDirectory();
+  await ensureJsonFile(dataFile, defaultCredentials);
 
   try {
     await fs.access(productsFile);
   } catch {
-    await fs.writeFile(productsFile, JSON.stringify([], null, 2), 'utf8');
+    const seedProducts = await readSeededProducts();
+    await fs.writeFile(productsFile, JSON.stringify(seedProducts, null, 2), 'utf8');
   }
+
+  await ensureJsonFile(ordersFile, defaultOrders);
+  await ensureJsonFile(reviewsFile, defaultReviews);
+  await ensureJsonFile(offersFile, defaultOffers);
+  await ensureJsonFile(storeSettingsFile, defaultStoreSettings);
+  await ensureJsonFile(paymentSettingsFile, defaultPaymentSettings);
+  await ensureJsonFile(userProfilesFile, {});
+  await ensureJsonFile(adminProfileFile, defaultAdminProfile);
+  await ensureJsonFile(productTypesFile, defaultProductTypes);
 }
 
 async function readCredentials() {
@@ -370,22 +430,45 @@ async function writeCredentials(nextState) {
 
 async function readProducts() {
   if (isPostgresEnabled && pool) {
-    await ensureDatabase();
-    const { rows } = await pool.query('SELECT * FROM products ORDER BY name');
-    return rows.map(normalizeProduct);
+    try {
+      await ensureDatabase();
+      const { rows } = await pool.query('SELECT * FROM products ORDER BY name');
+      if (rows.length > 0) {
+        return rows.map(normalizeProduct);
+      }
+
+      const seedProducts = await readSeededProducts();
+      if (seedProducts.length > 0) {
+        try {
+          await seedProductsFromJsonFile();
+        } catch (seedError) {
+          console.warn('Failed to seed Postgres from JSON file:', seedError.message);
+        }
+        return seedProducts;
+      }
+    } catch (error) {
+      console.warn('Falling back to local products file:', error.message);
+    }
   }
 
   await ensureStore();
   const raw = await fs.readFile(productsFile, 'utf8');
-  const products = JSON.parse(raw);
-  return Array.isArray(products) ? products.map(normalizeProduct) : [];
+  try {
+    const products = JSON.parse(raw);
+    return Array.isArray(products) ? products.map(normalizeProduct) : [];
+  } catch (error) {
+    console.warn('Invalid products file content, seeding from source:', error.message);
+    const seedProducts = await readSeededProducts();
+    await writeJsonFile(productsFile, seedProducts);
+    return seedProducts;
+  }
 }
 
 async function writeProducts(nextProducts) {
   if (isPostgresEnabled && pool) {
-    await ensureDatabase();
-    await pool.query('BEGIN');
     try {
+      await ensureDatabase();
+      await pool.query('BEGIN');
       await pool.query('DELETE FROM products');
       for (const product of nextProducts) {
         await pool.query(productInsertQuery, productRowParams(product));
@@ -393,14 +476,18 @@ async function writeProducts(nextProducts) {
       await pool.query('COMMIT');
       return nextProducts;
     } catch (error) {
-      await pool.query('ROLLBACK');
-      throw error;
+      try {
+        await pool.query('ROLLBACK');
+      } catch {
+        // ignore rollback failure
+      }
+      console.warn('Database write failed, using local products file instead:', error.message);
     }
   }
 
   await ensureStore();
   const normalizedProducts = nextProducts.map(normalizeProduct);
-  await fs.writeFile(productsFile, JSON.stringify(normalizedProducts, null, 2), 'utf8');
+  await writeJsonFile(productsFile, normalizedProducts);
   return normalizedProducts;
 }
 
@@ -416,7 +503,11 @@ async function ensureJsonFile(filePath, defaultValue) {
 async function readJsonFile(filePath, defaultValue) {
   await ensureJsonFile(filePath, defaultValue);
   const raw = await fs.readFile(filePath, 'utf8');
-  return JSON.parse(raw);
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return defaultValue;
+  }
 }
 
 async function writeJsonFile(filePath, nextValue) {
@@ -433,21 +524,45 @@ const defaultPaymentSettings = {};
 const defaultAdminProfile = {};
 const defaultProductTypes = ['Pickles', 'Podis', 'Non-Veg Pickles', 'Sweets & Snacks'];
 
+const seededProductsPaths = [
+  path.join(__dirname, '..', 'data', 'products.json'),
+  path.join(__dirname, 'data', 'products.json'),
+];
+
+async function readSeededProducts() {
+  for (const seedPath of seededProductsPaths) {
+    try {
+      const raw = await fs.readFile(seedPath, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        return parsed.map(normalizeProduct);
+      }
+    } catch {
+      // ignore missing or invalid seed files
+    }
+  }
+  return [];
+}
+
 async function readOrders() {
   if (isPostgresEnabled && pool) {
-    await ensureDatabase();
-    const { rows } = await pool.query('SELECT * FROM orders ORDER BY date DESC');
-    return rows.map((row) => ({
-      id: row.id,
-      date: row.date,
-      status: row.status,
-      paymentStatus: row.payment_status,
-      paymentMethod: row.payment_method,
-      totalAmount: Number(row.total_amount),
-      trackingNumber: row.tracking_number,
-      customer: row.customer || {},
-      items: row.items || [],
-    }));
+    try {
+      await ensureDatabase();
+      const { rows } = await pool.query('SELECT * FROM orders ORDER BY date DESC');
+      return rows.map((row) => ({
+        id: row.id,
+        date: row.date,
+        status: row.status,
+        paymentStatus: row.payment_status,
+        paymentMethod: row.payment_method,
+        totalAmount: Number(row.total_amount),
+        trackingNumber: row.tracking_number,
+        customer: row.customer || {},
+        items: row.items || [],
+      }));
+    } catch (error) {
+      console.warn('Falling back to local orders file:', error.message);
+    }
   }
   return readJsonFile(ordersFile, defaultOrders);
 }
@@ -468,47 +583,51 @@ function deepParseJsonValue(value) {
 
 async function writeOrders(nextOrders) {
   if (isPostgresEnabled && pool) {
-    await ensureDatabase();
-    await pool.query('BEGIN');
+    console.log('writeOrders: using Postgres path; order count =', Array.isArray(nextOrders) ? nextOrders.length : 0);
     try {
+      await ensureDatabase();
+      await pool.query('BEGIN');
       await pool.query('DELETE FROM orders');
       for (const order of nextOrders) {
-        const customerValue = deepParseJsonValue(order.customer || {});
-        const itemsValue = deepParseJsonValue(order.items || []);
-        const customerJson = JSON.stringify(customerValue);
-        const itemsJson = JSON.stringify(itemsValue);
-        console.log('writeOrders order payload:', {
-          id: order.id,
-          customerType: typeof customerValue,
-          customerJson,
-          itemsType: typeof itemsValue,
-          itemsJson,
-          itemsValueSample: Array.isArray(itemsValue) ? itemsValue.slice(0, 1) : itemsValue,
-        });
+        try {
+          const customerValue = deepParseJsonValue(order.customer || {});
+          const itemsValue = deepParseJsonValue(order.items || []);
+          const customerJson = typeof customerValue === 'string' ? JSON.parse(customerValue) : customerValue;
+          const itemsJson = typeof itemsValue === 'string' ? JSON.parse(itemsValue) : itemsValue;
 
-        await pool.query(
-          `INSERT INTO orders (id, date, status, payment_status, payment_method, total_amount, tracking_number, customer, items)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-          [
-            order.id,
-            order.date,
-            order.status,
-            order.paymentStatus,
-            order.paymentMethod,
-            order.totalAmount,
-            order.trackingNumber,
-            customerJson,
-            itemsJson,
-          ]
-        );
+          await pool.query(
+            `INSERT INTO orders (id, date, status, payment_status, payment_method, total_amount, tracking_number, customer, items)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+            [
+              order.id,
+              order.date,
+              order.status,
+              order.paymentStatus,
+              order.paymentMethod,
+              order.totalAmount,
+              order.trackingNumber,
+              customerJson,
+              itemsJson,
+            ]
+          );
+        } catch (rowError) {
+          console.error('writeOrders: failed inserting order row:', rowError && rowError.stack ? rowError.stack : rowError, 'order=', JSON.stringify(order));
+          throw rowError;
+        }
       }
       await pool.query('COMMIT');
       return nextOrders;
     } catch (error) {
-      await pool.query('ROLLBACK');
-      throw error;
+      try {
+        await pool.query('ROLLBACK');
+      } catch (rbErr) {
+        console.error('writeOrders: rollback failed:', rbErr && rbErr.stack ? rbErr.stack : rbErr);
+      }
+      console.error('writeOrders: Database order write failed, falling back to local file. Error:', error && error.stack ? error.stack : error);
+      return writeJsonFile(ordersFile, nextOrders);
     }
   }
+
   return writeJsonFile(ordersFile, nextOrders);
 }
 
@@ -1225,8 +1344,8 @@ app.get('/api/customers', async (_req, res) => {
 
 const port = Number(process.env.PORT || 3001);
 if (process.env.VERCEL !== 'true') {
-  app.listen(port, () => {
-    console.log(`Admin auth server listening on http://localhost:${port}`);
+  app.listen(port, '0.0.0.0', () => {
+    console.log(`Admin auth server listening on http://127.0.0.1:${port}`);
     if (isPostgresEnabled) {
       console.log('Connected to PostgreSQL via DATABASE_URL');
     } else {
