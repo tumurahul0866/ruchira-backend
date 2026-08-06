@@ -452,7 +452,20 @@ async function readProducts() {
   }
 
   await ensureStore();
-  const raw = await fs.readFile(productsFile, 'utf8');
+  let raw;
+  try {
+    raw = await fs.readFile(productsFile, 'utf8');
+  } catch (readErr) {
+    console.warn('readProducts: unable to read products file, falling back to seeded products:', readErr && readErr.message ? readErr.message : readErr);
+    const seedProducts = await readSeededProducts();
+    try {
+      await writeJsonFile(productsFile, seedProducts);
+    } catch (writeErr) {
+      console.warn('readProducts: failed to write seeded products file:', writeErr && writeErr.message ? writeErr.message : writeErr);
+    }
+    return seedProducts;
+  }
+
   try {
     const products = JSON.parse(raw);
     return Array.isArray(products) ? products.map(normalizeProduct) : [];
