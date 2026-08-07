@@ -1052,8 +1052,27 @@ app.put('/api/products/:id', async (req, res) => {
 
 app.delete('/api/products/:id', async (req, res) => {
   try {
+    const prodId = req.params.id;
+    if (isPostgresEnabled && pool) {
+      try {
+        const result = await pool.query('DELETE FROM products WHERE id = $1', [prodId]);
+        if (!result || typeof result.rowCount === 'undefined') {
+          console.error('Unexpected delete result for product', prodId, result);
+          return res.status(500).json({ error: 'Unexpected database response.' });
+        }
+        if (result.rowCount === 0) {
+          return res.status(404).json({ error: 'Product not found.' });
+        }
+        return res.json({ success: true, deleted: result.rowCount });
+      } catch (dbErr) {
+        console.error('Failed to delete product from Postgres:', dbErr && dbErr.stack ? dbErr.stack : dbErr);
+        return res.status(500).json({ error: 'Database error while deleting product.' });
+      }
+    }
+
+    // Fallback to local JSON store when Postgres is not enabled
     const products = await readProducts();
-    const updatedProducts = products.filter((item) => item.id !== req.params.id);
+    const updatedProducts = products.filter((item) => item.id !== prodId);
     await writeProducts(updatedProducts);
     res.json({ success: true });
   } catch (error) {
