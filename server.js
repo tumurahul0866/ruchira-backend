@@ -6,11 +6,16 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import pg from 'pg';
+import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 dotenv.config({ path: path.join(__dirname, '.env') });
+
+const JWT_SECRET = process.env.JWT_SECRET || 'vasuki_dev_secret';
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
 
 const isVercel =
   process.env.VERCEL === '1' ||
@@ -32,7 +37,7 @@ const adminProfileFile = path.join(dataDir, 'admin-profile.json');
 const productTypesFile = path.join(dataDir, 'product-types.json');
 
 const defaultCredentials = {
-  email: 'admin@vasukipickles.com',
+  email: 'ruchira@gmail.com',
   password: 'Admin@123',
 };
 
@@ -44,6 +49,25 @@ const pool = isPostgresEnabled
       ssl: { rejectUnauthorized: false },
     })
   : null;
+
+// Helper to run and log SQL queries with timing and error capture
+async function runQueryLogged(sql, params = []) {
+  if (!pool) {
+    throw new Error('Postgres pool is not initialized');
+  }
+  const start = Date.now();
+  try {
+    console.log('QUERY START', { sql: sql.replace(/\s+/g, ' ').trim().slice(0,200), params });
+    const res = await pool.query(sql, params);
+    const duration = Date.now() - start;
+    console.log('QUERY END', { sql: sql.replace(/\s+/g, ' ').trim().slice(0,200), duration_ms: duration, rowCount: res.rowCount });
+    return res;
+  } catch (err) {
+    const duration = Date.now() - start;
+    console.error('QUERY ERROR', { sql: sql.replace(/\s+/g, ' ').trim().slice(0,200), params, duration_ms: duration, message: err && err.message });
+    throw err;
+  }
+}
 
 const PRODUCT_COLUMNS = [
   'id',
@@ -243,8 +267,9 @@ async function seedProductsFromJsonFile() {
 
 async function ensureDatabase() {
   if (!pool) return;
-
-  await pool.query(`
+  if (global.__dbInitialized) return;
+  if (!pool) return;
+  await runQueryLogged(`
     CREATE TABLE IF NOT EXISTS admin_credentials (
       id SERIAL PRIMARY KEY,
       email TEXT NOT NULL,
@@ -253,7 +278,7 @@ async function ensureDatabase() {
     );
   `);
 
-  await pool.query(`
+  await runQueryLogged(`
     CREATE TABLE IF NOT EXISTS products (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -280,15 +305,15 @@ async function ensureDatabase() {
     );
   `);
 
-  await pool.query(`
+  await runQueryLogged(`
     ALTER TABLE products ADD COLUMN IF NOT EXISTS quantity_type TEXT;
   `);
 
-  await pool.query(`
+  await runQueryLogged(`
     ALTER TABLE products ADD COLUMN IF NOT EXISTS price_per_unit NUMERIC;
   `);
 
-  await pool.query(`
+  await runQueryLogged(`
     CREATE TABLE IF NOT EXISTS orders (
       id TEXT PRIMARY KEY,
       date TIMESTAMPTZ,
@@ -302,7 +327,7 @@ async function ensureDatabase() {
     );
   `);
 
-  await pool.query(`
+  await runQueryLogged(`
     CREATE TABLE IF NOT EXISTS reviews (
       id TEXT PRIMARY KEY,
       name TEXT,
@@ -311,11 +336,16 @@ async function ensureDatabase() {
       date TEXT,
       text TEXT,
       visible BOOLEAN,
-      verified_buyer BOOLEAN
+      verified_buyer BOOLEAN,
+      user_id TEXT,
+      user_email TEXT,
+      user_name TEXT,
+      created_at TIMESTAMPTZ,
+      updated_at TIMESTAMPTZ
     );
   `);
 
-  await pool.query(`
+  await runQueryLogged(`
     CREATE TABLE IF NOT EXISTS offers (
       id TEXT PRIMARY KEY,
       code TEXT,
@@ -328,57 +358,74 @@ async function ensureDatabase() {
     );
   `);
 
-  await pool.query(`
+  await runQueryLogged(`
     CREATE TABLE IF NOT EXISTS store_settings (
       id SERIAL PRIMARY KEY,
       settings JSONB
     );
   `);
 
-  await pool.query(`
+  await runQueryLogged(`
     CREATE TABLE IF NOT EXISTS payment_settings (
       id SERIAL PRIMARY KEY,
       settings JSONB
     );
   `);
 
-  await pool.query(`
+  await runQueryLogged(`
     CREATE TABLE IF NOT EXISTS user_profiles (
       email TEXT PRIMARY KEY,
       profile JSONB
     );
   `);
 
-  await pool.query(`
+  await runQueryLogged(`
     CREATE TABLE IF NOT EXISTS admin_profile (
       id SERIAL PRIMARY KEY,
       profile JSONB
     );
   `);
 
-  await pool.query(`
+  await runQueryLogged(`
     CREATE TABLE IF NOT EXISTS product_types (
       id SERIAL PRIMARY KEY,
       type TEXT UNIQUE
     );
   `);
 
-  const typeCount = await pool.query('SELECT COUNT(*)::INTEGER AS count FROM product_types');
+  await runQueryLogged(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      name TEXT,
+      email TEXT UNIQUE,
+      phone TEXT,
+      password_hash TEXT,
+      is_admin BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  const typeCount = await runQueryLogged('SELECT COUNT(*)::INTEGER AS count FROM product_types');
   if (typeCount.rows[0]?.count === 0) {
     for (const type of defaultProductTypes) {
-      await pool.query('INSERT INTO product_types (type) VALUES ($1)', [type]);
+      await runQueryLogged('INSERT INTO product_types (type) VALUES ($1)', [type]);
     }
   }
 
-  const result = await pool.query('SELECT id FROM admin_credentials LIMIT 1');
+  const result = await runQueryLogged('SELECT id FROM admin_credentials LIMIT 1');
   if (result.rowCount === 0) {
-    await pool.query(
+    // Hash default admin password before inserting
+    const hashed = await bcrypt.hash(defaultCredentials.password, 10);
+    await runQueryLogged(
       'INSERT INTO admin_credentials (email, password) VALUES ($1, $2)',
-      [defaultCredentials.email, defaultCredentials.password]
+      [defaultCredentials.email, hashed]
     );
   }
 
+  await normalizeAdminCredentials();
   await seedProductsFromJsonFile();
+  global.__dbInitialized = true;
 }
 
 async function ensureDataDirectory() {
@@ -414,9 +461,13 @@ async function ensureStore() {
 
 async function readCredentials() {
   if (isPostgresEnabled && pool) {
-    await ensureDatabase();
-    const { rows } = await pool.query('SELECT email, password FROM admin_credentials ORDER BY id LIMIT 1');
-    return rows[0] || defaultCredentials;
+    try {
+      const r = await runQueryLogged('SELECT email, password FROM admin_credentials ORDER BY id LIMIT 1');
+      return r.rows[0] || defaultCredentials;
+    } catch (err) {
+      console.error('readCredentials: DB error', err && err.message);
+      throw err;
+    }
   }
 
   await ensureStore();
@@ -425,26 +476,85 @@ async function readCredentials() {
 }
 
 async function writeCredentials(nextState) {
+  // Normalize email and ensure password is hashed before storing
+  const email = String(nextState.email || defaultCredentials.email).trim().toLowerCase();
+  const password = String(nextState.password || '').trim();
+  const isHashed = password.startsWith('$2a$') || password.startsWith('$2b$') || password.startsWith('$2y$');
+  const toStorePassword = isHashed ? password : await bcrypt.hash(password, 10);
+
   if (isPostgresEnabled && pool) {
     await ensureDatabase();
-    const { rowCount } = await pool.query(
-      'UPDATE admin_credentials SET email = $1, password = $2, updated_at = NOW() WHERE id = (SELECT id FROM admin_credentials LIMIT 1);',
-      [nextState.email, nextState.password]
-    );
-
-    if (rowCount === 0) {
-      await pool.query(
-        'INSERT INTO admin_credentials (email, password) VALUES ($1, $2)',
-        [nextState.email, nextState.password]
+    try {
+      const r = await runQueryLogged(
+        'UPDATE admin_credentials SET email = $1, password = $2, updated_at = NOW() WHERE id = (SELECT id FROM admin_credentials LIMIT 1);',
+        [email, toStorePassword]
       );
-    }
+      const rowCount = r.rowCount;
 
-    return nextState;
+      if (rowCount === 0) {
+        await runQueryLogged('INSERT INTO admin_credentials (email, password) VALUES ($1, $2)', [email, toStorePassword]);
+      }
+
+      return { ...nextState, email, password: toStorePassword };
+    } catch (err) {
+      console.error('writeCredentials: DB error', err && err.message);
+      throw err;
+    }
   }
 
   await ensureStore();
-  await fs.writeFile(dataFile, JSON.stringify(nextState, null, 2), 'utf8');
-  return nextState;
+  const out = { ...nextState, email, password: toStorePassword };
+  await fs.writeFile(dataFile, JSON.stringify(out, null, 2), 'utf8');
+  return out;
+}
+
+async function normalizeAdminCredentials() {
+  if (!isPostgresEnabled || !pool) return;
+  await ensureDatabase();
+  try {
+    const r = await runQueryLogged('SELECT id, email, password FROM admin_credentials ORDER BY id LIMIT 1');
+    const credentials = r.rows[0];
+    if (!credentials) return;
+  } catch (err) {
+    console.error('normalizeAdminCredentials: initial SELECT error', err && err.message);
+    throw err;
+  }
+
+  const currentEmail = String(credentials.email || '').trim();
+  const storedEmail = currentEmail.toLowerCase();
+  const defaultEmail = String(defaultCredentials.email).trim().toLowerCase();
+  const storedPassword = String(credentials.password || '');
+  const isHashed = storedPassword.startsWith('$2a$') || storedPassword.startsWith('$2b$') || storedPassword.startsWith('$2y$');
+
+  const passwordMatchesDefault = isHashed
+    ? await bcrypt.compare(defaultCredentials.password, storedPassword)
+    : storedPassword === defaultCredentials.password;
+
+  const shouldNormalizeEmail = passwordMatchesDefault && storedEmail !== defaultEmail;
+  const shouldHashPassword = !isHashed;
+
+  if (!shouldNormalizeEmail && !shouldHashPassword) {
+    return;
+  }
+
+  const hashedPassword = isHashed ? storedPassword : await bcrypt.hash(storedPassword, 10);
+  const emailToStore = shouldNormalizeEmail ? defaultCredentials.email : currentEmail;
+
+  try {
+    await runQueryLogged('UPDATE admin_credentials SET email = $1, password = $2, updated_at = NOW() WHERE id = $3', [emailToStore, hashedPassword, credentials.id]);
+  } catch (err) {
+    console.error('normalizeAdminCredentials: DB error', err && err.message);
+    throw err;
+  }
+}
+
+async function passwordsMatch(storedPassword, providedPassword) {
+  if (!storedPassword || !providedPassword) return false;
+  const normalized = String(providedPassword);
+  if (storedPassword.startsWith('$2a$') || storedPassword.startsWith('$2b$') || storedPassword.startsWith('$2y$')) {
+    return bcrypt.compare(normalized, storedPassword);
+  }
+  return normalized === storedPassword;
 }
 
 async function readProducts() {
@@ -676,6 +786,11 @@ async function readReviews() {
       text: row.text,
       visible: row.visible,
       verifiedBuyer: row.verified_buyer,
+      user_id: row.user_id,
+      user_email: row.user_email,
+      user_name: row.user_name,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
     }));
   }
   return readJsonFile(reviewsFile, defaultReviews);
@@ -689,8 +804,8 @@ async function writeReviews(nextReviews) {
       await pool.query('DELETE FROM reviews');
       for (const review of nextReviews) {
         await pool.query(
-          `INSERT INTO reviews (id, name, product, rating, date, text, visible, verified_buyer)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          `INSERT INTO reviews (id, name, product, rating, date, text, visible, verified_buyer, user_id, user_email, user_name, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
           [
             review.id,
             review.name,
@@ -700,6 +815,11 @@ async function writeReviews(nextReviews) {
             review.text,
             review.visible,
             review.verifiedBuyer,
+            review.user_id || null,
+            review.user_email || null,
+            review.user_name || null,
+            review.created_at || null,
+            review.updated_at || null,
           ]
         );
       }
@@ -923,17 +1043,75 @@ app.get('/health', (_req, res) => {
 
 export { app };
 
-app.get('/api/admin-credentials', async (_req, res) => {
+app.get('/api/admin-credentials', requireAdmin, async (_req, res) => {
   try {
     const credentials = await readCredentials();
-    res.json(credentials);
+    res.json({ email: credentials.email });
   } catch (error) {
     console.error('Failed to read admin credentials:', error);
     res.status(500).json({ error: 'Unable to read admin credentials.' });
   }
 });
 
-app.post('/api/admin-credentials/password', async (req, res) => {
+// Admin login endpoint
+app.post('/api/admin/login', async (req, res) => {
+  try {
+    console.log('ROUTE START: /api/admin/login', { body: req.body });
+    const { email, password } = req.body || {};
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+    console.log('Before loading admin credentials');
+    const creds = await readCredentials();
+    console.log('After loading admin credentials');
+    const inputEmail = String(email).trim().toLowerCase();
+    const storedEmail = String(creds.email || '').trim().toLowerCase();
+    const storedPass = String(creds.password || '');
+    const defaultLogin = inputEmail === defaultCredentials.email.toLowerCase() && password === defaultCredentials.password;
+
+    let ok = false;
+    if (storedEmail === inputEmail) {
+      console.log('Before password comparison');
+      if (storedPass.startsWith('$2')) {
+        ok = await bcrypt.compare(password, storedPass);
+      } else {
+        ok = password === storedPass;
+        if (ok) {
+          await writeCredentials({ email: creds.email, password });
+        }
+      }
+      console.log('After password comparison', { ok });
+    }
+
+    console.log('DEBUG: admin compare', { inputEmail, storedEmail, storedPassPrefix: storedPass.slice(0, 4), ok, defaultLogin });
+
+    if (!ok && defaultLogin) {
+      // Restore the default admin credentials when the default admin login is used.
+      await writeCredentials({ email: defaultCredentials.email, password: defaultCredentials.password });
+      ok = true;
+    }
+
+    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+    console.log('Before JWT generation');
+    const token = generateToken({ id: 'admin', email: defaultLogin ? defaultCredentials.email : creds.email, name: 'Administrator', isAdmin: true, role: 'admin' });
+    console.log('After JWT generation');
+    console.log('Before res.json for admin login');
+    const out = { token, email: defaultLogin ? defaultCredentials.email : creds.email, name: 'Administrator' };
+    res.json(out);
+    console.log('After res.json for admin login');
+  } catch (error) {
+    console.error('admin login error', error);
+    return res.status(500).json({ error: 'Unable to authenticate' });
+  }
+});
+
+// Protect admin updates — require admin JWT
+function requireAdmin(req, res, next) {
+  authenticateToken(req, res, () => {
+    if (!req.user || !req.user.isAdmin) return res.status(403).json({ error: 'Forbidden' });
+    return next();
+  });
+}
+
+app.post('/api/admin-credentials/password', requireAdmin, async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body || {};
     const credentials = await readCredentials();
@@ -942,7 +1120,8 @@ app.post('/api/admin-credentials/password', async (req, res) => {
       return res.status(400).json({ error: 'A valid current password and a new password of at least 6 characters are required.' });
     }
 
-    if (currentPassword !== credentials.password) {
+    const ok = await passwordsMatch(credentials.password, currentPassword);
+    if (!ok) {
       return res.status(401).json({ error: 'Current password is incorrect.' });
     }
 
@@ -954,7 +1133,7 @@ app.post('/api/admin-credentials/password', async (req, res) => {
   }
 });
 
-app.post('/api/admin-credentials/email', async (req, res) => {
+app.post('/api/admin-credentials/email', requireAdmin, async (req, res) => {
   try {
     const { currentPassword, newEmail } = req.body || {};
     const credentials = await readCredentials();
@@ -963,7 +1142,8 @@ app.post('/api/admin-credentials/email', async (req, res) => {
       return res.status(400).json({ error: 'A valid current password and a new email address are required.' });
     }
 
-    if (currentPassword !== credentials.password) {
+    const ok = await passwordsMatch(credentials.password, currentPassword);
+    if (!ok) {
       return res.status(401).json({ error: 'Current password is incorrect.' });
     }
 
@@ -999,7 +1179,7 @@ app.get('/api/products/:id', async (req, res) => {
   }
 });
 
-app.post('/api/products', async (req, res) => {
+app.post('/api/products', requireAdmin, async (req, res) => {
   try {
     const product = req.body || {};
     if (!product.name) {
@@ -1024,7 +1204,7 @@ app.post('/api/products', async (req, res) => {
   }
 });
 
-app.put('/api/products/:id', async (req, res) => {
+app.put('/api/products/:id', requireAdmin, async (req, res) => {
   try {
     const productUpdates = normalizeProductInput(req.body || {});
     const products = await readProducts();
@@ -1050,7 +1230,7 @@ app.put('/api/products/:id', async (req, res) => {
   }
 });
 
-app.delete('/api/products/:id', async (req, res) => {
+app.delete('/api/products/:id', requireAdmin, async (req, res) => {
   try {
     const prodId = req.params.id;
     if (isPostgresEnabled && pool) {
@@ -1121,7 +1301,7 @@ app.post('/api/orders', async (req, res) => {
   }
 });
 
-app.put('/api/orders/:id', async (req, res) => {
+app.put('/api/orders/:id', requireAdmin, async (req, res) => {
   try {
     const updates = req.body || {};
     const orders = await readOrders();
@@ -1143,7 +1323,7 @@ app.put('/api/orders/:id', async (req, res) => {
   }
 });
 
-app.delete('/api/orders/:id', async (req, res) => {
+app.delete('/api/orders/:id', requireAdmin, async (req, res) => {
   try {
     const orders = await readOrders();
     const updatedOrders = orders.filter((item) => item.id !== req.params.id);
@@ -1152,6 +1332,209 @@ app.delete('/api/orders/:id', async (req, res) => {
   } catch (error) {
     console.error('Failed to delete order:', error);
     res.status(500).json({ error: 'Unable to delete order.' });
+  }
+});
+
+// --- AUTH HELPERS ---
+function generateToken(payload) {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+}
+
+function authenticateToken(req, res, next) {
+  const auth = req.headers.authorization || req.query.token || req.headers['x-access-token'];
+  if (!auth) return res.status(401).json({ error: 'Unauthorized' });
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : auth;
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    return next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+// Register user
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    console.log('ROUTE START: /api/auth/register', { isPostgresEnabled, hasPool: Boolean(pool), body: req.body });
+    const { name, email, phone, password } = req.body || {};
+    if (!email || !password || !name) return res.status(400).json({ error: 'Missing required fields' });
+    const cleanEmail = String(email).trim().toLowerCase();
+    // check existing
+    if (isPostgresEnabled && pool) {
+      console.log('Before checking existing user in Postgres', cleanEmail);
+      try {
+        const existing = await runQueryLogged('SELECT id FROM users WHERE LOWER(email) = $1 LIMIT 1', [cleanEmail]);
+        console.log('After checking existing user', { rowCount: existing.rowCount });
+        if (existing.rowCount > 0) return res.status(409).json({ error: 'Email already registered' });
+      } catch (err) {
+        console.error('Error while checking existing user', err && err.message);
+        throw err;
+      }
+
+      const id = `u${Date.now().toString().slice(-8)}`;
+      console.log('Before bcrypt password hashing');
+      const hash = await bcrypt.hash(password, 10);
+      console.log('After bcrypt password hashing');
+
+      try {
+        console.log('Before INSERT query for new user');
+        await runQueryLogged('INSERT INTO users (id, name, email, phone, password_hash, is_admin) VALUES ($1,$2,$3,$4,$5,$6)', [id, name, cleanEmail, phone || '', hash, false]);
+        console.log('After INSERT query for new user');
+      } catch (err) {
+        console.error('Error during INSERT of new user', err && err.message);
+        throw err;
+      }
+
+      console.log('Before JWT generation for new user');
+      const token = generateToken({ id, email: cleanEmail, name, isAdmin: false });
+      console.log('After JWT generation for new user');
+      console.log('Before res.json for register');
+      const out = { id, name, email: cleanEmail, token };
+      res.json(out);
+      console.log('After res.json for register');
+      return;
+    }
+
+    // JSON fallback
+    await ensureStore();
+    const profiles = await readJsonFile(userProfilesFile, {});
+    if (profiles[cleanEmail]) return res.status(409).json({ error: 'Email already registered' });
+    const id = `u${Date.now().toString().slice(-8)}`;
+    const hash = await bcrypt.hash(password, 10);
+    profiles[cleanEmail] = { id, name, email: cleanEmail, phone: phone || '', password_hash: hash, created_at: new Date().toISOString() };
+    await writeJsonFile(userProfilesFile, profiles);
+    const token = generateToken({ id, email: cleanEmail, name, isAdmin: false });
+    return res.json({ id, name, email: cleanEmail, token });
+  } catch (error) {
+    console.error('register error', error);
+    res.status(500).json({ error: 'Unable to register' });
+  }
+});
+
+// Login user
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    if (!email || !password) return res.status(400).json({ error: 'Missing credentials' });
+    const cleanEmail = String(email).trim().toLowerCase();
+    if (isPostgresEnabled && pool) {
+      await ensureDatabase();
+      const { rows } = await pool.query('SELECT id, name, email, password_hash, is_admin FROM users WHERE LOWER(email) = $1 LIMIT 1', [cleanEmail]);
+      const user = rows[0];
+      if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+      const ok = await bcrypt.compare(password, user.password_hash || '');
+      if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+      const token = generateToken({ id: user.id, email: user.email, name: user.name, isAdmin: !!user.is_admin });
+      return res.json({ id: user.id, name: user.name, email: user.email, token });
+    }
+
+    await ensureStore();
+    const profiles = await readJsonFile(userProfilesFile, {});
+    const profile = profiles[cleanEmail];
+    if (!profile) return res.status(401).json({ error: 'Invalid credentials' });
+    const ok = await bcrypt.compare(password, profile.password_hash || '');
+    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+    const token = generateToken({ id: profile.id, email: profile.email, name: profile.name, isAdmin: false });
+    return res.json({ id: profile.id, name: profile.name, email: profile.email, token });
+  } catch (error) {
+    console.error('login error', error);
+    res.status(500).json({ error: 'Unable to login' });
+  }
+});
+
+// Get / update profile
+app.get('/api/auth/profile', authenticateToken, async (req, res) => {
+  try {
+    if (req.user?.isAdmin) {
+      return res.json({ id: req.user.id, name: req.user.name || 'Administrator', email: req.user.email, phone: '', isAdmin: true });
+    }
+
+    const email = req.user.email;
+    if (isPostgresEnabled && pool) {
+      const { rows } = await pool.query('SELECT id, name, email, phone, is_admin FROM users WHERE LOWER(email) = $1 LIMIT 1', [email]);
+      const u = rows[0];
+      if (!u) return res.status(404).json({ error: 'Not found' });
+      return res.json({ id: u.id, name: u.name, email: u.email, phone: u.phone, isAdmin: !!u.is_admin });
+    }
+    await ensureStore();
+    const profiles = await readJsonFile(userProfilesFile, {});
+    const p = profiles[email];
+    if (!p) return res.status(404).json({ error: 'Not found' });
+    return res.json({ id: p.id, name: p.name, email: p.email, phone: p.phone, isAdmin: false });
+  } catch (error) {
+    console.error('profile error', error);
+    res.status(500).json({ error: 'Unable to fetch profile' });
+  }
+});
+
+app.put('/api/auth/profile', authenticateToken, async (req, res) => {
+  try {
+    const updates = req.body || {};
+    const email = req.user.email;
+    if (isPostgresEnabled && pool) {
+      await ensureDatabase();
+      const { rows } = await pool.query('SELECT id FROM users WHERE LOWER(email) = $1 LIMIT 1', [email]);
+      const u = rows[0];
+      if (!u) return res.status(404).json({ error: 'Not found' });
+      const now = new Date().toISOString();
+      await pool.query('UPDATE users SET name = $1, phone = $2, updated_at = $3 WHERE LOWER(email) = $4', [updates.name || null, updates.phone || null, now, email]);
+      return res.json({ success: true });
+    }
+    await ensureStore();
+    const profiles = await readJsonFile(userProfilesFile, {});
+    if (!profiles[email]) return res.status(404).json({ error: 'Not found' });
+    profiles[email].name = updates.name || profiles[email].name;
+    profiles[email].phone = updates.phone || profiles[email].phone;
+    profiles[email].updated_at = new Date().toISOString();
+    await writeJsonFile(userProfilesFile, profiles);
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('profile update error', error);
+    res.status(500).json({ error: 'Unable to update profile' });
+  }
+});
+
+// Forgot/reset password stubs (can wire email service later)
+app.post('/api/auth/forgot', async (req, res) => {
+  // Accept email, respond success whether or not email exists to avoid leaking
+  return res.json({ success: true });
+});
+
+app.post('/api/auth/reset', authenticateToken, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body || {};
+    if (!currentPassword || !newPassword || newPassword.length < 8) {
+      return res.status(400).json({ error: 'Current password and a new password of at least 8 characters are required.' });
+    }
+
+    const email = req.user.email;
+    if (isPostgresEnabled && pool) {
+      await ensureDatabase();
+      const { rows } = await pool.query('SELECT password_hash FROM users WHERE LOWER(email) = $1 LIMIT 1', [email]);
+      const user = rows[0];
+      if (!user) return res.status(404).json({ error: 'User not found.' });
+      const ok = await passwordsMatch(user.password_hash, currentPassword);
+      if (!ok) return res.status(401).json({ error: 'Current password is incorrect.' });
+      const passwordHash = await bcrypt.hash(newPassword, 10);
+      await pool.query('UPDATE users SET password_hash = $1, updated_at = NOW() WHERE email = $2', [passwordHash, email]);
+      return res.json({ success: true });
+    }
+
+    await ensureStore();
+    const profiles = await readJsonFile(userProfilesFile, {});
+    const profile = profiles[email];
+    if (!profile) return res.status(404).json({ error: 'User not found.' });
+    const ok = await passwordsMatch(profile.password_hash, currentPassword);
+    if (!ok) return res.status(401).json({ error: 'Current password is incorrect.' });
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+    profile.password_hash = passwordHash;
+    profile.updated_at = new Date().toISOString();
+    await writeJsonFile(userProfilesFile, profiles);
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('reset password error', error);
+    res.status(500).json({ error: 'Unable to reset password.' });
   }
 });
 
@@ -1165,20 +1548,37 @@ app.get('/api/reviews', async (_req, res) => {
   }
 });
 
-app.post('/api/reviews', async (req, res) => {
+// Create a review (requires auth)
+app.post('/api/reviews', authenticateToken, async (req, res) => {
   try {
     const review = req.body || {};
     const reviews = await readReviews();
+    const userId = req.user.id;
+    const userEmail = req.user.email;
+    const userName = req.user.name || req.user.email;
+
+    // Prevent duplicate review by same user for same product
+    const exists = reviews.find((r) => r.product === review.product && (r.user_id === userId || r.user_email === userEmail));
+    if (exists) {
+      return res.status(409).json({ error: 'User has already reviewed this product' });
+    }
+
+    const now = new Date().toISOString();
     const nextReview = {
       ...review,
       id: review.id || `r${Date.now().toString().slice(-8)}`,
-      name: review.name || 'Valued Customer',
+      name: userName,
       product: review.product || '',
       rating: Number(review.rating) || 5,
-      date: review.date || new Date().toISOString(),
+      date: now,
       visible: review.visible !== undefined ? review.visible : true,
       verifiedBuyer: review.verifiedBuyer !== undefined ? review.verifiedBuyer : true,
       text: review.text || '',
+      user_id: userId,
+      user_email: userEmail,
+      user_name: userName,
+      created_at: now,
+      updated_at: now,
     };
     reviews.unshift(nextReview);
     await writeReviews(reviews);
@@ -1189,11 +1589,17 @@ app.post('/api/reviews', async (req, res) => {
   }
 });
 
-app.delete('/api/reviews/:id', async (req, res) => {
+// Delete review (auth + ownership or admin)
+app.delete('/api/reviews/:id', authenticateToken, async (req, res) => {
   try {
     const reviews = await readReviews();
-    const updatedReviews = reviews.filter((item) => item.id !== req.params.id);
-    await writeReviews(updatedReviews);
+    const index = reviews.findIndex((item) => item.id === req.params.id);
+    if (index < 0) return res.status(404).json({ error: 'Review not found' });
+    const target = reviews[index];
+    const isOwner = req.user.isAdmin || (target.user_id && target.user_id === req.user.id) || (target.user_email && target.user_email === req.user.email);
+    if (!isOwner) return res.status(403).json({ error: 'Forbidden' });
+    const updated = reviews.filter((item) => item.id !== req.params.id);
+    await writeReviews(updated);
     res.json({ success: true });
   } catch (error) {
     console.error('Failed to delete review:', error);
@@ -1201,17 +1607,21 @@ app.delete('/api/reviews/:id', async (req, res) => {
   }
 });
 
-app.put('/api/reviews/:id', async (req, res) => {
+// Update review (auth + ownership or admin)
+app.put('/api/reviews/:id', authenticateToken, async (req, res) => {
   try {
     const updates = req.body || {};
     const reviews = await readReviews();
     const index = reviews.findIndex((item) => item.id === req.params.id);
-    if (index < 0) {
-      return res.status(404).json({ error: 'Review not found.' });
-    }
+    if (index < 0) return res.status(404).json({ error: 'Review not found' });
+    const target = reviews[index];
+    const isOwner = req.user.isAdmin || (target.user_id && target.user_id === req.user.id) || (target.user_email && target.user_email === req.user.email);
+    if (!isOwner) return res.status(403).json({ error: 'Forbidden' });
+    const now = new Date().toISOString();
     reviews[index] = {
       ...reviews[index],
       ...updates,
+      updated_at: now,
       id: req.params.id,
     };
     await writeReviews(reviews);
@@ -1232,7 +1642,7 @@ app.get('/api/offers', async (_req, res) => {
   }
 });
 
-app.post('/api/offers', async (req, res) => {
+app.post('/api/offers', requireAdmin, async (req, res) => {
   try {
     const offer = req.body || {};
     const offers = await readOffers();
@@ -1261,7 +1671,7 @@ app.post('/api/offers', async (req, res) => {
   }
 });
 
-app.delete('/api/offers/:id', async (req, res) => {
+app.delete('/api/offers/:id', requireAdmin, async (req, res) => {
   try {
     const offers = await readOffers();
     const updatedOffers = offers.filter((item) => item.id !== req.params.id);
@@ -1283,7 +1693,7 @@ app.get('/api/store-settings', async (_req, res) => {
   }
 });
 
-app.post('/api/store-settings', async (req, res) => {
+app.post('/api/store-settings', requireAdmin, async (req, res) => {
   try {
     const settings = req.body || {};
     const saved = await writeStoreSettings(settings);
@@ -1304,7 +1714,7 @@ app.get('/api/payment-settings', async (_req, res) => {
   }
 });
 
-app.post('/api/payment-settings', async (req, res) => {
+app.post('/api/payment-settings', requireAdmin, async (req, res) => {
   try {
     const settings = req.body || {};
     const saved = await writePaymentSettings(settings);
@@ -1315,7 +1725,7 @@ app.post('/api/payment-settings', async (req, res) => {
   }
 });
 
-app.get('/api/admin-profile', async (_req, res) => {
+app.get('/api/admin-profile', requireAdmin, async (_req, res) => {
   try {
     const profile = await readAdminProfile();
     res.json(profile);
@@ -1325,7 +1735,7 @@ app.get('/api/admin-profile', async (_req, res) => {
   }
 });
 
-app.post('/api/admin-profile', async (req, res) => {
+app.post('/api/admin-profile', requireAdmin, async (req, res) => {
   try {
     const profile = req.body || {};
     const saved = await writeAdminProfile(profile);
@@ -1346,7 +1756,7 @@ app.get('/api/product-types', async (_req, res) => {
   }
 });
 
-app.post('/api/product-types', async (req, res) => {
+app.post('/api/product-types', requireAdmin, async (req, res) => {
   try {
     const types = req.body || [];
     if (!Array.isArray(types)) {
@@ -1360,9 +1770,13 @@ app.post('/api/product-types', async (req, res) => {
   }
 });
 
-app.get('/api/user-profiles/:email', async (req, res) => {
+app.get('/api/user-profiles/:email', authenticateToken, async (req, res) => {
   try {
-    const email = req.params.email;
+    const email = String(req.params.email || '').trim().toLowerCase();
+    if (!email) return res.status(400).json({ error: 'Email is required.' });
+    if (!req.user.isAdmin && req.user.email !== email) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
     const profile = await readUserProfile(email);
     res.json(profile);
   } catch (error) {
@@ -1371,9 +1785,13 @@ app.get('/api/user-profiles/:email', async (req, res) => {
   }
 });
 
-app.post('/api/user-profiles/:email', async (req, res) => {
+app.post('/api/user-profiles/:email', authenticateToken, async (req, res) => {
   try {
-    const email = req.params.email;
+    const email = String(req.params.email || '').trim().toLowerCase();
+    if (!email) return res.status(400).json({ error: 'Email is required.' });
+    if (!req.user.isAdmin && req.user.email !== email) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
     const profile = req.body || {};
     const saved = await writeUserProfile(email, profile);
     res.json(saved);
@@ -1383,7 +1801,7 @@ app.post('/api/user-profiles/:email', async (req, res) => {
   }
 });
 
-app.get('/api/customers', async (_req, res) => {
+app.get('/api/customers', requireAdmin, async (_req, res) => {
   try {
     const customers = await readCustomers();
     res.json(customers);
@@ -1394,13 +1812,29 @@ app.get('/api/customers', async (_req, res) => {
 });
 
 const port = Number(process.env.PORT || 3001);
-if (process.env.VERCEL !== 'true') {
-  app.listen(port, '0.0.0.0', () => {
-    console.log(`Admin auth server listening on http://127.0.0.1:${port}`);
+
+async function startServer() {
+  try {
     if (isPostgresEnabled) {
-      console.log('Connected to PostgreSQL via DATABASE_URL');
+      console.log('Initializing database on startup...');
+      await ensureDatabase();
+      console.log('Database initialization complete');
     } else {
       console.log('Using local JSON data store because DATABASE_URL is not configured.');
     }
-  });
+
+    if (process.env.VERCEL !== 'true') {
+      app.listen(port, '0.0.0.0', () => {
+        console.log(`Admin auth server listening on http://127.0.0.1:${port}`);
+        if (isPostgresEnabled) {
+          console.log('Connected to PostgreSQL via DATABASE_URL');
+        }
+      });
+    }
+  } catch (err) {
+    console.error('Startup failed during database initialization:', err && (err.stack || err.message || err));
+    process.exit(1);
+  }
 }
+
+startServer();
