@@ -24,7 +24,7 @@ const isVercel =
   Boolean(process.env.NOW_REGION);
 const dataDir = isVercel
   ? path.join(os.tmpdir(), 'vasuki-data')
-  : path.join(__dirname, '..', 'data');
+  : path.join(__dirname, 'data');
 const dataFile = path.join(dataDir, 'admin-settings.json');
 const productsFile = path.join(dataDir, 'products.json');
 const ordersFile = path.join(dataDir, 'orders.json');
@@ -267,23 +267,29 @@ async function seedProductsFromJsonFile() {
 
 // Ensure database tables exist and perform necessary seeding with detailed logs
 async function ensureDatabase() {
+  const DB_TIMEOUT_MS = 5000;
+  const withDbTimeout = (promise, step) => Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`Timeout after ${DB_TIMEOUT_MS}ms in ${step}`)), DB_TIMEOUT_MS))
+  ]);
+
   if (!pool) return;
   if (global.__dbInitialized) return;
   if (!pool) return;
 
   console.log('DB init: creating admin_credentials');
-  await runQueryLogged(`
+  await withDbTimeout(runQueryLogged(`
     CREATE TABLE IF NOT EXISTS admin_credentials (
       id SERIAL PRIMARY KEY,
       email TEXT NOT NULL,
       password TEXT NOT NULL,
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
-  `);
+  `), 'create admin_credentials');
   console.log('DB init: admin_credentials ready');
 
   console.log('DB init: creating products table');
-  await runQueryLogged(`
+  await withDbTimeout(runQueryLogged(`
     CREATE TABLE IF NOT EXISTS products (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -308,23 +314,23 @@ async function ensureDatabase() {
       image TEXT,
       additional_images JSONB
     );
-  `);
+  `), 'create products');
   console.log('DB init: products table ready');
 
   console.log('DB init: adding quantity_type column');
-  await runQueryLogged(`
+  await withDbTimeout(runQueryLogged(`
     ALTER TABLE products ADD COLUMN IF NOT EXISTS quantity_type TEXT;
-  `);
+  `), 'add quantity_type column');
   console.log('DB init: quantity_type column ready');
 
   console.log('DB init: adding price_per_unit column');
-  await runQueryLogged(`
+  await withDbTimeout(runQueryLogged(`
     ALTER TABLE products ADD COLUMN IF NOT EXISTS price_per_unit NUMERIC;
-  `);
+  `), 'add price_per_unit column');
   console.log('DB init: price_per_unit column ready');
 
   console.log('DB init: creating orders table');
-  await runQueryLogged(`
+  await withDbTimeout(runQueryLogged(`
     CREATE TABLE IF NOT EXISTS orders (
       id TEXT PRIMARY KEY,
       date TIMESTAMPTZ,
@@ -336,11 +342,11 @@ async function ensureDatabase() {
       customer JSONB,
       items JSONB
     );
-  `);
+  `), 'create orders');
   console.log('DB init: orders table ready');
 
   console.log('DB init: creating reviews table');
-  await runQueryLogged(`
+  await withDbTimeout(runQueryLogged(`
     CREATE TABLE IF NOT EXISTS reviews (
       id TEXT PRIMARY KEY,
       name TEXT,
@@ -356,11 +362,11 @@ async function ensureDatabase() {
       created_at TIMESTAMPTZ,
       updated_at TIMESTAMPTZ
     );
-  `);
+  `), 'create reviews');
   console.log('DB init: reviews table ready');
 
   console.log('DB init: creating offers table');
-  await runQueryLogged(`
+  await withDbTimeout(runQueryLogged(`
     CREATE TABLE IF NOT EXISTS offers (
       id TEXT PRIMARY KEY,
       code TEXT,
@@ -371,56 +377,56 @@ async function ensureDatabase() {
       product_id TEXT,
       min_order_value NUMERIC
     );
-  `);
+  `), 'create offers');
   console.log('DB init: offers table ready');
 
   console.log('DB init: creating store_settings table');
-  await runQueryLogged(`
+  await withDbTimeout(runQueryLogged(`
     CREATE TABLE IF NOT EXISTS store_settings (
       id SERIAL PRIMARY KEY,
       settings JSONB
     );
-  `);
+  `), 'create store_settings');
   console.log('DB init: store_settings ready');
 
   console.log('DB init: creating payment_settings table');
-  await runQueryLogged(`
+  await withDbTimeout(runQueryLogged(`
     CREATE TABLE IF NOT EXISTS payment_settings (
       id SERIAL PRIMARY KEY,
       settings JSONB
     );
-  `);
+  `), 'create payment_settings');
   console.log('DB init: payment_settings ready');
 
   console.log('DB init: creating user_profiles table');
-  await runQueryLogged(`
+  await withDbTimeout(runQueryLogged(`
     CREATE TABLE IF NOT EXISTS user_profiles (
       email TEXT PRIMARY KEY,
       profile JSONB
     );
-  `);
+  `), 'create user_profiles');
   console.log('DB init: user_profiles ready');
 
   console.log('DB init: creating admin_profile table');
-  await runQueryLogged(`
+  await withDbTimeout(runQueryLogged(`
     CREATE TABLE IF NOT EXISTS admin_profile (
       id SERIAL PRIMARY KEY,
       profile JSONB
     );
-  `);
+  `), 'create admin_profile');
   console.log('DB init: admin_profile ready');
 
   console.log('DB init: creating product_types table');
-  await runQueryLogged(`
+  await withDbTimeout(runQueryLogged(`
     CREATE TABLE IF NOT EXISTS product_types (
       id SERIAL PRIMARY KEY,
       type TEXT UNIQUE
     );
-  `);
+  `), 'create product_types');
   console.log('DB init: product_types ready');
 
   console.log('DB init: creating users table');
-  await runQueryLogged(`
+  await withDbTimeout(runQueryLogged(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
       name TEXT,
@@ -431,40 +437,41 @@ async function ensureDatabase() {
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
-  `);
+  `), 'create users');
   console.log('DB init: users table ready');
 
   console.log('DB init: counting product types');
-  const typeCount = await runQueryLogged('SELECT COUNT(*)::INTEGER AS count FROM product_types');
+  const typeCount = await withDbTimeout(runQueryLogged('SELECT COUNT(*)::INTEGER AS count FROM product_types'), 'count product_types');
   if (typeCount.rows[0]?.count === 0) {
     console.log('DB init: inserting default product types');
     for (const type of defaultProductTypes) {
-      await runQueryLogged('INSERT INTO product_types (type) VALUES ($1)', [type]);
+      await withDbTimeout(runQueryLogged('INSERT INTO product_types (type) VALUES ($1)', [type]), `insert product_type ${type}`);
     }
     console.log('DB init: default product types inserted');
   }
 
   console.log('DB init: checking admin credentials');
-  const result = await runQueryLogged('SELECT id FROM admin_credentials LIMIT 1');
+  const result = await withDbTimeout(runQueryLogged('SELECT id FROM admin_credentials LIMIT 1'), 'select admin_credentials');
   if (result.rowCount === 0) {
     console.log('DB init: inserting default admin credentials');
     const hashed = await bcrypt.hash(defaultCredentials.password, 10);
-    await runQueryLogged(
+    await withDbTimeout(runQueryLogged(
       'INSERT INTO admin_credentials (email, password) VALUES ($1, $2)',
       [defaultCredentials.email, hashed]
-    );
+    ), 'insert default admin credentials');
     console.log('DB init: default admin credentials inserted');
   }
 
   console.log('DB init: normalizing admin credentials');
-  await normalizeAdminCredentials();
+  await withDbTimeout(normalizeAdminCredentials(), 'normalize admin credentials');
   console.log('DB init: seeding products from JSON (async)');
   // Fire-and-forget seeding to avoid blocking startup
   seedProductsFromJsonFile()
     .then(() => console.log('DB init: product seeding completed'))
     .catch(err => console.error('DB init: product seeding error', err));
   console.log('DB init: all init steps completed (excluding product seeding)');
-  global.__dbInitialized = true;
+  console.log('STARTUP: DATABASE INITIALIZATION COMPLETE');
+    global.__dbInitialized = true;
 }
 
 async function ensureDataDirectory() {
