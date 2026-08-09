@@ -265,10 +265,13 @@ async function seedProductsFromJsonFile() {
   }
 }
 
+// Ensure database tables exist and perform necessary seeding with detailed logs
 async function ensureDatabase() {
   if (!pool) return;
   if (global.__dbInitialized) return;
   if (!pool) return;
+
+  console.log('DB init: creating admin_credentials');
   await runQueryLogged(`
     CREATE TABLE IF NOT EXISTS admin_credentials (
       id SERIAL PRIMARY KEY,
@@ -277,7 +280,9 @@ async function ensureDatabase() {
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
+  console.log('DB init: admin_credentials ready');
 
+  console.log('DB init: creating products table');
   await runQueryLogged(`
     CREATE TABLE IF NOT EXISTS products (
       id TEXT PRIMARY KEY,
@@ -304,15 +309,21 @@ async function ensureDatabase() {
       additional_images JSONB
     );
   `);
+  console.log('DB init: products table ready');
 
+  console.log('DB init: adding quantity_type column');
   await runQueryLogged(`
     ALTER TABLE products ADD COLUMN IF NOT EXISTS quantity_type TEXT;
   `);
+  console.log('DB init: quantity_type column ready');
 
+  console.log('DB init: adding price_per_unit column');
   await runQueryLogged(`
     ALTER TABLE products ADD COLUMN IF NOT EXISTS price_per_unit NUMERIC;
   `);
+  console.log('DB init: price_per_unit column ready');
 
+  console.log('DB init: creating orders table');
   await runQueryLogged(`
     CREATE TABLE IF NOT EXISTS orders (
       id TEXT PRIMARY KEY,
@@ -326,7 +337,9 @@ async function ensureDatabase() {
       items JSONB
     );
   `);
+  console.log('DB init: orders table ready');
 
+  console.log('DB init: creating reviews table');
   await runQueryLogged(`
     CREATE TABLE IF NOT EXISTS reviews (
       id TEXT PRIMARY KEY,
@@ -344,7 +357,9 @@ async function ensureDatabase() {
       updated_at TIMESTAMPTZ
     );
   `);
+  console.log('DB init: reviews table ready');
 
+  console.log('DB init: creating offers table');
   await runQueryLogged(`
     CREATE TABLE IF NOT EXISTS offers (
       id TEXT PRIMARY KEY,
@@ -357,42 +372,54 @@ async function ensureDatabase() {
       min_order_value NUMERIC
     );
   `);
+  console.log('DB init: offers table ready');
 
+  console.log('DB init: creating store_settings table');
   await runQueryLogged(`
     CREATE TABLE IF NOT EXISTS store_settings (
       id SERIAL PRIMARY KEY,
       settings JSONB
     );
   `);
+  console.log('DB init: store_settings ready');
 
+  console.log('DB init: creating payment_settings table');
   await runQueryLogged(`
     CREATE TABLE IF NOT EXISTS payment_settings (
       id SERIAL PRIMARY KEY,
       settings JSONB
     );
   `);
+  console.log('DB init: payment_settings ready');
 
+  console.log('DB init: creating user_profiles table');
   await runQueryLogged(`
     CREATE TABLE IF NOT EXISTS user_profiles (
       email TEXT PRIMARY KEY,
       profile JSONB
     );
   `);
+  console.log('DB init: user_profiles ready');
 
+  console.log('DB init: creating admin_profile table');
   await runQueryLogged(`
     CREATE TABLE IF NOT EXISTS admin_profile (
       id SERIAL PRIMARY KEY,
       profile JSONB
     );
   `);
+  console.log('DB init: admin_profile ready');
 
+  console.log('DB init: creating product_types table');
   await runQueryLogged(`
     CREATE TABLE IF NOT EXISTS product_types (
       id SERIAL PRIMARY KEY,
       type TEXT UNIQUE
     );
   `);
+  console.log('DB init: product_types ready');
 
+  console.log('DB init: creating users table');
   await runQueryLogged(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
@@ -405,26 +432,35 @@ async function ensureDatabase() {
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
+  console.log('DB init: users table ready');
 
+  console.log('DB init: counting product types');
   const typeCount = await runQueryLogged('SELECT COUNT(*)::INTEGER AS count FROM product_types');
   if (typeCount.rows[0]?.count === 0) {
+    console.log('DB init: inserting default product types');
     for (const type of defaultProductTypes) {
       await runQueryLogged('INSERT INTO product_types (type) VALUES ($1)', [type]);
     }
+    console.log('DB init: default product types inserted');
   }
 
+  console.log('DB init: checking admin credentials');
   const result = await runQueryLogged('SELECT id FROM admin_credentials LIMIT 1');
   if (result.rowCount === 0) {
-    // Hash default admin password before inserting
+    console.log('DB init: inserting default admin credentials');
     const hashed = await bcrypt.hash(defaultCredentials.password, 10);
     await runQueryLogged(
       'INSERT INTO admin_credentials (email, password) VALUES ($1, $2)',
       [defaultCredentials.email, hashed]
     );
+    console.log('DB init: default admin credentials inserted');
   }
 
+  console.log('DB init: normalizing admin credentials');
   await normalizeAdminCredentials();
+  console.log('DB init: seeding products from JSON');
   await seedProductsFromJsonFile();
+  console.log('DB init: all init steps completed');
   global.__dbInitialized = true;
 }
 
@@ -435,8 +471,7 @@ async function ensureDataDirectory() {
 
 async function ensureStore() {
   if (isPostgresEnabled) {
-    await ensureDatabase();
-    return;
+    return; // Database initialization is handled at startup
   }
 
   await ensureDataDirectory();
@@ -483,7 +518,6 @@ async function writeCredentials(nextState) {
   const toStorePassword = isHashed ? password : await bcrypt.hash(password, 10);
 
   if (isPostgresEnabled && pool) {
-    await ensureDatabase();
     try {
       const r = await runQueryLogged(
         'UPDATE admin_credentials SET email = $1, password = $2, updated_at = NOW() WHERE id = (SELECT id FROM admin_credentials LIMIT 1);',
@@ -510,10 +544,10 @@ async function writeCredentials(nextState) {
 
 async function normalizeAdminCredentials() {
   if (!isPostgresEnabled || !pool) return;
-  await ensureDatabase();
+  let credentials;
   try {
     const r = await runQueryLogged('SELECT id, email, password FROM admin_credentials ORDER BY id LIMIT 1');
-    const credentials = r.rows[0];
+    credentials = r.rows[0];
     if (!credentials) return;
   } catch (err) {
     console.error('normalizeAdminCredentials: initial SELECT error', err && err.message);
@@ -560,7 +594,7 @@ async function passwordsMatch(storedPassword, providedPassword) {
 async function readProducts() {
   if (isPostgresEnabled && pool) {
     try {
-      await ensureDatabase();
+      
       const { rows } = await pool.query('SELECT * FROM products ORDER BY name');
       if (rows.length > 0) {
         return rows.map(normalizeProduct);
@@ -609,7 +643,7 @@ async function readProducts() {
 async function writeProducts(nextProducts) {
   if (isPostgresEnabled && pool) {
     try {
-      await ensureDatabase();
+      
       // Upsert each product individually; do not use a transaction so one failure
       // doesn't abort the entire batch. Log per-row failures and continue.
       for (const product of nextProducts) {
@@ -688,7 +722,7 @@ async function readSeededProducts() {
 async function readOrders() {
   if (isPostgresEnabled && pool) {
     try {
-      await ensureDatabase();
+      
       const { rows } = await pool.query('SELECT * FROM orders ORDER BY date DESC');
       console.log('readOrders: retrieved', rows.length, 'rows from Postgres');
       return rows.map((row) => ({
@@ -727,7 +761,7 @@ async function writeOrders(nextOrders) {
   if (isPostgresEnabled && pool) {
     console.log('writeOrders: using Postgres path; order count =', Array.isArray(nextOrders) ? nextOrders.length : 0);
     try {
-      await ensureDatabase();
+      
       await pool.query('BEGIN');
       await pool.query('DELETE FROM orders');
       for (const order of nextOrders) {
@@ -775,7 +809,7 @@ async function writeOrders(nextOrders) {
 
 async function readReviews() {
   if (isPostgresEnabled && pool) {
-    await ensureDatabase();
+    
     const { rows } = await pool.query('SELECT * FROM reviews ORDER BY date DESC');
     return rows.map((row) => ({
       id: row.id,
@@ -798,7 +832,7 @@ async function readReviews() {
 
 async function writeReviews(nextReviews) {
   if (isPostgresEnabled && pool) {
-    await ensureDatabase();
+    
     await pool.query('BEGIN');
     try {
       await pool.query('DELETE FROM reviews');
@@ -835,7 +869,7 @@ async function writeReviews(nextReviews) {
 
 async function readOffers() {
   if (isPostgresEnabled && pool) {
-    await ensureDatabase();
+    
     const { rows } = await pool.query('SELECT * FROM offers ORDER BY id');
     return rows.map((row) => ({
       id: row.id,
@@ -853,7 +887,7 @@ async function readOffers() {
 
 async function writeOffers(nextOffers) {
   if (isPostgresEnabled && pool) {
-    await ensureDatabase();
+    
     await pool.query('BEGIN');
     try {
       await pool.query('DELETE FROM offers');
@@ -885,7 +919,7 @@ async function writeOffers(nextOffers) {
 
 async function readStoreSettings() {
   if (isPostgresEnabled && pool) {
-    await ensureDatabase();
+    
     const { rows } = await pool.query('SELECT settings FROM store_settings ORDER BY id LIMIT 1');
     return rows[0]?.settings || defaultStoreSettings;
   }
@@ -894,7 +928,7 @@ async function readStoreSettings() {
 
 async function writeStoreSettings(nextSettings) {
   if (isPostgresEnabled && pool) {
-    await ensureDatabase();
+    
     const { rowCount } = await pool.query(
       'UPDATE store_settings SET settings = $1 WHERE id = (SELECT id FROM store_settings LIMIT 1)',
       [nextSettings]
@@ -909,7 +943,7 @@ async function writeStoreSettings(nextSettings) {
 
 async function readPaymentSettings() {
   if (isPostgresEnabled && pool) {
-    await ensureDatabase();
+    
     const { rows } = await pool.query('SELECT settings FROM payment_settings ORDER BY id LIMIT 1');
     return rows[0]?.settings || defaultPaymentSettings;
   }
@@ -918,7 +952,7 @@ async function readPaymentSettings() {
 
 async function writePaymentSettings(nextSettings) {
   if (isPostgresEnabled && pool) {
-    await ensureDatabase();
+    
     const { rowCount } = await pool.query(
       'UPDATE payment_settings SET settings = $1 WHERE id = (SELECT id FROM payment_settings LIMIT 1)',
       [nextSettings]
@@ -933,7 +967,7 @@ async function writePaymentSettings(nextSettings) {
 
 async function readAdminProfile() {
   if (isPostgresEnabled && pool) {
-    await ensureDatabase();
+    
     const { rows } = await pool.query('SELECT profile FROM admin_profile ORDER BY id LIMIT 1');
     return rows[0]?.profile || defaultAdminProfile;
   }
@@ -942,7 +976,7 @@ async function readAdminProfile() {
 
 async function writeAdminProfile(nextProfile) {
   if (isPostgresEnabled && pool) {
-    await ensureDatabase();
+    
     const { rowCount } = await pool.query(
       'UPDATE admin_profile SET profile = $1 WHERE id = (SELECT id FROM admin_profile LIMIT 1)',
       [nextProfile]
@@ -957,7 +991,7 @@ async function writeAdminProfile(nextProfile) {
 
 async function readProductTypes() {
   if (isPostgresEnabled && pool) {
-    await ensureDatabase();
+    
     const { rows } = await pool.query('SELECT type FROM product_types ORDER BY id');
     return rows.map((row) => row.type);
   }
@@ -966,7 +1000,7 @@ async function readProductTypes() {
 
 async function writeProductTypes(types) {
   if (isPostgresEnabled && pool) {
-    await ensureDatabase();
+    
     await pool.query('BEGIN');
     try {
       await pool.query('DELETE FROM product_types');
@@ -985,7 +1019,7 @@ async function writeProductTypes(types) {
 
 async function readUserProfile(email) {
   if (isPostgresEnabled && pool) {
-    await ensureDatabase();
+    
     const { rows } = await pool.query('SELECT profile FROM user_profiles WHERE email = $1', [email]);
     return rows[0]?.profile || { name: '', email, phone: '', addresses: [], wishlist: [] };
   }
@@ -995,7 +1029,7 @@ async function readUserProfile(email) {
 
 async function writeUserProfile(email, profile) {
   if (isPostgresEnabled && pool) {
-    await ensureDatabase();
+    
     const { rowCount } = await pool.query(
       'UPDATE user_profiles SET profile=$1 WHERE email=$2',
       [profile, email]
@@ -1419,7 +1453,6 @@ app.post('/api/auth/login', async (req, res) => {
     if (!email || !password) return res.status(400).json({ error: 'Missing credentials' });
     const cleanEmail = String(email).trim().toLowerCase();
     if (isPostgresEnabled && pool) {
-      await ensureDatabase();
       const { rows } = await pool.query('SELECT id, name, email, password_hash, is_admin FROM users WHERE LOWER(email) = $1 LIMIT 1', [cleanEmail]);
       const user = rows[0];
       if (!user) return res.status(401).json({ error: 'Invalid credentials' });
@@ -1427,16 +1460,17 @@ app.post('/api/auth/login', async (req, res) => {
       if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
       const token = generateToken({ id: user.id, email: user.email, name: user.name, isAdmin: !!user.is_admin });
       return res.json({ id: user.id, name: user.name, email: user.email, token });
-    }
+    } else {
+      await ensureStore();
+      const profiles = await readJsonFile(userProfilesFile, {});
 
-    await ensureStore();
-    const profiles = await readJsonFile(userProfilesFile, {});
-    const profile = profiles[cleanEmail];
-    if (!profile) return res.status(401).json({ error: 'Invalid credentials' });
-    const ok = await bcrypt.compare(password, profile.password_hash || '');
-    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
-    const token = generateToken({ id: profile.id, email: profile.email, name: profile.name, isAdmin: false });
-    return res.json({ id: profile.id, name: profile.name, email: profile.email, token });
+      const profile = profiles[cleanEmail];
+      if (!profile) return res.status(401).json({ error: 'Invalid credentials' });
+      const ok = await bcrypt.compare(password, profile.password_hash || '');
+      if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+      const token = generateToken({ id: profile.id, email: profile.email, name: profile.name, isAdmin: false });
+      return res.json({ id: profile.id, name: profile.name, email: profile.email, token });
+    }
   } catch (error) {
     console.error('login error', error);
     res.status(500).json({ error: 'Unable to login' });
@@ -1473,7 +1507,7 @@ app.put('/api/auth/profile', authenticateToken, async (req, res) => {
     const updates = req.body || {};
     const email = req.user.email;
     if (isPostgresEnabled && pool) {
-      await ensureDatabase();
+      
       const { rows } = await pool.query('SELECT id FROM users WHERE LOWER(email) = $1 LIMIT 1', [email]);
       const u = rows[0];
       if (!u) return res.status(404).json({ error: 'Not found' });
@@ -1510,7 +1544,7 @@ app.post('/api/auth/reset', authenticateToken, async (req, res) => {
 
     const email = req.user.email;
     if (isPostgresEnabled && pool) {
-      await ensureDatabase();
+      
       const { rows } = await pool.query('SELECT password_hash FROM users WHERE LOWER(email) = $1 LIMIT 1', [email]);
       const user = rows[0];
       if (!user) return res.status(404).json({ error: 'User not found.' });
@@ -1801,6 +1835,16 @@ app.post('/api/user-profiles/:email', authenticateToken, async (req, res) => {
   }
 });
 
+// Lightweight health endpoint for Render health checks
+app.get('/health', (_req, res) => {
+  res.status(200).json({ status: 'ok' });
+});
+
+// Fallback root health endpoint (Render may probe '/')
+app.get('/', (_req, res) => {
+  res.status(200).json({ status: 'ok' });
+});
+
 app.get('/api/customers', requireAdmin, async (_req, res) => {
   try {
     const customers = await readCustomers();
@@ -1812,6 +1856,7 @@ app.get('/api/customers', requireAdmin, async (_req, res) => {
 });
 
 const port = Number(process.env.PORT || 3001);
+console.log('STARTUP PORT:', port);
 
 async function startServer() {
   try {
@@ -1823,14 +1868,14 @@ async function startServer() {
       console.log('Using local JSON data store because DATABASE_URL is not configured.');
     }
 
-    if (process.env.VERCEL !== 'true') {
-      app.listen(port, '0.0.0.0', () => {
-        console.log(`Admin auth server listening on http://127.0.0.1:${port}`);
-        if (isPostgresEnabled) {
-          console.log('Connected to PostgreSQL via DATABASE_URL');
-        }
-      });
-    }
+    const server = app.listen(port, '0.0.0.0', () => {
+      console.log('STARTUP: LISTEN CALLBACK REACHED');
+      console.log('STARTUP: SERVER ADDRESS:', server.address());
+      console.log(`Admin auth server listening on http://0.0.0.0:${port}`);
+      if (isPostgresEnabled) {
+        console.log('Connected to PostgreSQL via DATABASE_URL');
+      }
+    });
   } catch (err) {
     console.error('Startup failed during database initialization:', err && (err.stack || err.message || err));
     process.exit(1);
