@@ -458,9 +458,12 @@ async function ensureDatabase() {
 
   console.log('DB init: normalizing admin credentials');
   await normalizeAdminCredentials();
-  console.log('DB init: seeding products from JSON');
-  await seedProductsFromJsonFile();
-  console.log('DB init: all init steps completed');
+  console.log('DB init: seeding products from JSON (async)');
+  // Fire-and-forget seeding to avoid blocking startup
+  seedProductsFromJsonFile()
+    .then(() => console.log('DB init: product seeding completed'))
+    .catch(err => console.error('DB init: product seeding error', err));
+  console.log('DB init: all init steps completed (excluding product seeding)');
   global.__dbInitialized = true;
 }
 
