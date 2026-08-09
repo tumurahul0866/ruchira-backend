@@ -35,6 +35,7 @@ const paymentSettingsFile = path.join(dataDir, 'payment-settings.json');
 const userProfilesFile = path.join(dataDir, 'user-profiles.json');
 const adminProfileFile = path.join(dataDir, 'admin-profile.json');
 const productTypesFile = path.join(dataDir, 'product-types.json');
+const shippingRulesFile = path.join(dataDir, 'shipping-rules.json');
 
 const defaultCredentials = {
   email: 'ruchira@gmail.com',
@@ -425,6 +426,15 @@ async function ensureDatabase() {
   `), 'create product_types');
   console.log('DB init: product_types ready');
 
+  console.log('DB init: creating shipping_rules table');
+  await withDbTimeout(runQueryLogged(`
+    CREATE TABLE IF NOT EXISTS shipping_rules (
+      id SERIAL PRIMARY KEY,
+      rules JSONB
+    );
+  `), 'create shipping_rules');
+  console.log('DB init: shipping_rules ready');
+
   console.log('DB init: creating users table');
   await withDbTimeout(runQueryLogged(`
     CREATE TABLE IF NOT EXISTS users (
@@ -502,6 +512,7 @@ async function ensureStore() {
   await ensureJsonFile(userProfilesFile, {});
   await ensureJsonFile(adminProfileFile, defaultAdminProfile);
   await ensureJsonFile(productTypesFile, defaultProductTypes);
+  await ensureJsonFile(shippingRulesFile, defaultShippingRules);
 }
 
 async function readCredentials() {
@@ -708,6 +719,62 @@ const defaultStoreSettings = {};
 const defaultPaymentSettings = {};
 const defaultAdminProfile = {};
 const defaultProductTypes = ['Pickles', 'Podis', 'Non-Veg Pickles', 'Sweets & Snacks'];
+
+const defaultShippingRules = {
+  defaultCharge: 80,
+  states: {
+    'Andhra Pradesh': {
+      defaultCharge: 70,
+      districts: {
+        'East Godavari':  { charge: 50, active: true },
+        'West Godavari':  { charge: 50, active: true },
+        'Krishna':        { charge: 60, active: true },
+        'Guntur':         { charge: 60, active: true },
+        'Visakhapatnam':  { charge: 70, active: true },
+        'Srikakulam':     { charge: 70, active: true },
+        'Vizianagaram':   { charge: 70, active: true },
+        'Kurnool':        { charge: 70, active: true },
+        'Kadapa':         { charge: 70, active: true },
+        'Nellore':        { charge: 65, active: true },
+        'Chittoor':       { charge: 70, active: true },
+        'Prakasam':       { charge: 65, active: true },
+        'Eluru':          { charge: 55, active: true },
+        'Bapatla':        { charge: 60, active: true },
+        'Palnadu':        { charge: 65, active: true },
+        'NTR':            { charge: 60, active: true },
+        'Konaseema':      { charge: 55, active: true },
+        'Anakapalli':     { charge: 65, active: true },
+        'Alluri Sitharama Raju': { charge: 75, active: true },
+        'Sri Potti Sriramulu Nellore': { charge: 65, active: true }
+      }
+    },
+    'Telangana': {
+      defaultCharge: 65,
+      districts: {
+        'Hyderabad':       { charge: 60, active: true },
+        'Rangareddy':      { charge: 60, active: true },
+        'Medchal Malkajgiri': { charge: 60, active: true },
+        'Warangal':        { charge: 70, active: true },
+        'Karimnagar':      { charge: 70, active: true },
+        'Nizamabad':       { charge: 70, active: true },
+        'Khammam':         { charge: 70, active: true },
+        'Nalgonda':        { charge: 70, active: true },
+        'Mahabubnagar':    { charge: 70, active: true },
+        'Adilabad':        { charge: 75, active: true },
+        'Siddipet':        { charge: 70, active: true },
+        'Sangareddy':      { charge: 65, active: true },
+        'Mancherial':      { charge: 75, active: true },
+        'Jagtial':         { charge: 75, active: true },
+        'Peddapalli':      { charge: 75, active: true },
+        'Suryapet':        { charge: 70, active: true },
+        'Bhadradri Kothagudem': { charge: 70, active: true },
+        'Mulugu':          { charge: 75, active: true },
+        'Jayashankar Bhupalpally': { charge: 75, active: true },
+        'Wanaparthy':      { charge: 70, active: true }
+      }
+    }
+  }
+};
 
 const seededProductsPaths = [
   path.join(__dirname, '..', 'data', 'products.json'),
@@ -997,6 +1064,99 @@ async function writeAdminProfile(nextProfile) {
     return nextProfile;
   }
   return writeJsonFile(adminProfileFile, nextProfile);
+}
+
+async function readShippingRules() {
+  if (isPostgresEnabled && pool) {
+    const { rows } = await pool.query('SELECT rules FROM shipping_rules ORDER BY id LIMIT 1');
+    return rows[0]?.rules || defaultShippingRules;
+  }
+  return readJsonFile(shippingRulesFile, defaultShippingRules);
+}
+
+async function writeShippingRules(nextRules) {
+  if (isPostgresEnabled && pool) {
+    const { rowCount } = await pool.query(
+      'UPDATE shipping_rules SET rules = $1 WHERE id = (SELECT id FROM shipping_rules LIMIT 1)',
+      [nextRules]
+    );
+    if (rowCount === 0) {
+      await pool.query('INSERT INTO shipping_rules (rules) VALUES ($1)', [nextRules]);
+    }
+    return nextRules;
+  }
+  return writeJsonFile(shippingRulesFile, nextRules);
+}
+
+/**
+ * Normalize a location name for fuzzy matching:
+ * lowercase, trim, remove punctuation, collapse spaces.
+ */
+function normalizeName(name) {
+  return String(name || '')
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9\s]/g, '')
+    .replace(/\s+/g, ' ');
+}
+
+/**
+ * Find a district key in a districts map using normalized matching.
+ * Returns the matched key or null.
+ */
+function findDistrictKey(districts, targetDistrict) {
+  if (!districts || !targetDistrict) return null;
+  const normalizedTarget = normalizeName(targetDistrict);
+  // 1. Exact normalized match
+  for (const key of Object.keys(districts)) {
+    if (normalizeName(key) === normalizedTarget) return key;
+  }
+  // 2. Partial match: target contains key or key contains target
+  for (const key of Object.keys(districts)) {
+    const normKey = normalizeName(key);
+    if (normalizedTarget.includes(normKey) || normKey.includes(normalizedTarget)) return key;
+  }
+  return null;
+}
+
+/**
+ * Find a state key in the states map using normalized matching.
+ */
+function findStateKey(states, targetState) {
+  if (!states || !targetState) return null;
+  const normalizedTarget = normalizeName(targetState);
+  for (const key of Object.keys(states)) {
+    if (normalizeName(key) === normalizedTarget) return key;
+  }
+  // Partial match
+  for (const key of Object.keys(states)) {
+    const normKey = normalizeName(key);
+    if (normalizedTarget.includes(normKey) || normKey.includes(normalizedTarget)) return key;
+  }
+  return null;
+}
+
+/**
+ * Calculate shipping charge.
+ * Priority: district rule (if active) → state default → global default
+ */
+function calculateShippingCharge(state, district, rules) {
+  const r = rules || defaultShippingRules;
+  const globalDefault = Number(r.defaultCharge) || 80;
+
+  const stateKey = findStateKey(r.states, state);
+  if (!stateKey) return globalDefault;
+
+  const stateData = r.states[stateKey];
+  const stateDefault = Number(stateData?.defaultCharge) || globalDefault;
+
+  const districtKey = findDistrictKey(stateData?.districts, district);
+  if (!districtKey) return stateDefault;
+
+  const districtData = stateData.districts[districtKey];
+  if (!districtData || districtData.active === false) return stateDefault;
+
+  return Number(districtData.charge) || stateDefault;
 }
 
 async function readProductTypes() {
@@ -1324,6 +1484,21 @@ app.post('/api/orders', async (req, res) => {
       return res.status(400).json({ error: 'Order must include customer and items.' });
     }
 
+    // Re-calculate shipping charge server-side — ignore any client-submitted value
+    const shippingRules = await readShippingRules();
+    const customerState = order.customer?.state || '';
+    const customerDistrict = order.customer?.district || '';
+    const verifiedShippingCharge = calculateShippingCharge(customerState, customerDistrict, shippingRules);
+
+    // Re-compute totalAmount from items + verified shipping charge
+    let itemsSubtotal = 0;
+    if (Array.isArray(order.items)) {
+      order.items.forEach((item) => {
+        itemsSubtotal += (Number(item.weightOption?.price) || 0) * (Number(item.quantity) || 1);
+      });
+    }
+    const verifiedTotal = itemsSubtotal + verifiedShippingCharge;
+
     const existingOrders = await readOrders();
     const nextOrder = {
       ...order,
@@ -1333,6 +1508,15 @@ app.post('/api/orders', async (req, res) => {
       paymentStatus: order.paymentStatus || 'Pending',
       paymentMethod: order.paymentMethod || 'COD',
       trackingNumber: order.trackingNumber || `TRK${Math.floor(100000 + Math.random() * 900000)}`,
+      totalAmount: verifiedTotal,
+      customer: {
+        ...order.customer,
+        shippingCharge: verifiedShippingCharge,
+        itemsSubtotal,
+        state: customerState,
+        district: customerDistrict,
+        pincode: order.customer?.pincode || '',
+      },
     };
 
     existingOrders.unshift(nextOrder);
@@ -1862,6 +2046,74 @@ app.get('/api/customers', requireAdmin, async (_req, res) => {
   } catch (error) {
     console.error('Failed to read customers:', error);
     res.status(500).json({ error: 'Unable to read customers.' });
+  }
+});
+
+// --- SHIPPING RULES ---
+
+app.get('/api/shipping-rules', async (_req, res) => {
+  try {
+    const rules = await readShippingRules();
+    res.json(rules);
+  } catch (error) {
+    console.error('Failed to read shipping rules:', error);
+    res.status(500).json({ error: 'Unable to read shipping rules.' });
+  }
+});
+
+app.post('/api/shipping-rules', requireAdmin, async (req, res) => {
+  try {
+    const rules = req.body || {};
+    const saved = await writeShippingRules(rules);
+    res.json(saved);
+  } catch (error) {
+    console.error('Failed to save shipping rules:', error);
+    res.status(500).json({ error: 'Unable to save shipping rules.' });
+  }
+});
+
+// PIN code lookup — proxies api.postalpincode.in and enriches with shipping charge
+app.get('/api/pincode/:pin', async (req, res) => {
+  const pin = String(req.params.pin || '').trim();
+  if (!/^[0-9]{6}$/.test(pin)) {
+    return res.status(400).json({ valid: false, error: 'Invalid PIN code. Must be 6 digits.' });
+  }
+
+  try {
+    const postalUrl = `https://api.postalpincode.in/pincode/${pin}`;
+    const postalRes = await fetch(postalUrl, { signal: AbortSignal.timeout(8000) });
+    if (!postalRes.ok) {
+      return res.status(502).json({ valid: false, error: 'Postal API unavailable.' });
+    }
+    const data = await postalRes.json();
+    const block = Array.isArray(data) ? data[0] : null;
+
+    if (!block || block.Status !== 'Success' || !Array.isArray(block.PostOffice) || block.PostOffice.length === 0) {
+      return res.status(404).json({ valid: false, error: 'PIN code not found or not serviceable.' });
+    }
+
+    const po = block.PostOffice[0];
+    const state = po.State || '';
+    const district = po.District || '';
+    const postOffice = po.Name || '';
+    const circle = po.Circle || '';
+
+    // Calculate shipping charge using current rules
+    const rules = await readShippingRules();
+    const shippingCharge = calculateShippingCharge(state, district, rules);
+
+    return res.json({
+      valid: true,
+      pin,
+      state,
+      district,
+      postOffice,
+      circle,
+      shippingCharge,
+    });
+  } catch (error) {
+    console.error('PIN lookup error:', error && error.message);
+    return res.status(502).json({ valid: false, error: 'Unable to look up PIN code. Please try again.' });
   }
 });
 
