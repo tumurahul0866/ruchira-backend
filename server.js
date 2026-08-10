@@ -6,67 +6,11 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import crypto from 'crypto';
-import nodemailer from 'nodemailer';
 import pg from 'pg';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import admin from 'firebase-admin';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-dotenv.config({ path: path.join(__dirname, '.env') });
-
-// Email Transporter for Password Reset OTP
-async function sendPasswordResetEmail(toEmail, otpCode) {
-  const host = process.env.SMTP_HOST;
-  const port = parseInt(process.env.SMTP_PORT || '587', 10);
-  const user = process.env.SMTP_USER;
-  const pass = process.env.SMTP_PASS;
-  const from = process.env.EMAIL_FROM || '"Ruchira Pickles" <no-reply@ruchira-pickles.com>';
-
-  if (host && user && pass) {
-    try {
-      const transporter = nodemailer.createTransport({
-        host,
-        port,
-        secure: port === 465,
-        auth: { user, pass },
-      });
-
-      await transporter.sendMail({
-        from,
-        to: toEmail,
-        subject: 'Password Reset OTP — Ruchira Pickles',
-        html: `
-          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e0e0e0; border-radius: 8px;">
-            <h2 style="color: #5C4033; text-align: center;">Ruchira Pickles</h2>
-            <p>Hello,</p>
-            <p>You requested a password reset for your account. Your 6-digit verification code is:</p>
-            <div style="background-color: #F8F3E8; border: 2px dashed #5C4033; padding: 15px; text-align: center; margin: 20px 0; border-radius: 8px;">
-              <span style="font-size: 32px; font-weight: bold; letter-spacing: 6px; color: #5C4033;">${otpCode}</span>
-            </div>
-            <p>This code will expire in <strong>10 minutes</strong>. Do not share this code with anyone.</p>
-            <p style="color: #888; font-size: 12px; margin-top: 30px;">If you did not request this password reset, please ignore this email.</p>
-          </div>
-        `,
-      });
-      return true;
-    } catch (err) {
-      console.error('SMTP email dispatch error:', err.message);
-      return false;
-    }
-  }
-
-  // DEV ONLY guard: Log OTP strictly in local development mode when SMTP is missing
-  if (process.env.NODE_ENV !== 'production') {
-    console.warn(`[DEV ONLY] SMTP credentials not set. Password reset OTP for ${toEmail}: ${otpCode}`);
-    return true;
-  } else {
-    console.warn(`[PROD WARNING] SMTP credentials missing in production. Cannot send password reset OTP to ${toEmail}.`);
-    return false;
-  }
-}
+import { sendPasswordResetOTP } from './services/emailService.js';
 
 let firebaseAdminInitialized = false;
 try {
@@ -2184,8 +2128,8 @@ app.post(['/api/auth/forgot-password', '/api/auth/forgot'], async (req, res) => 
       }
     }
 
-    // Dispatch OTP via email helper
-    await sendPasswordResetEmail(cleanEmail, otpCode);
+    // Dispatch OTP via Brevo email service
+    await sendPasswordResetOTP(cleanEmail, otpCode);
 
     return res.json(genericResponse);
   } catch (error) {
