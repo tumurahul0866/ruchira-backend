@@ -1301,7 +1301,30 @@ async function readCustomers() {
 }
 
 const app = express();
-app.use(cors());
+
+const allowedOrigins = [
+  'https://ruchira-pickels.vercel.app',
+  'http://localhost:5173',
+  'http://localhost:3000',
+  'http://127.0.0.1:5173',
+  'http://127.0.0.1:3000',
+];
+
+if (process.env.FRONTEND_URL) {
+  allowedOrigins.push(process.env.FRONTEND_URL.trim().replace(/\/$/, ''));
+}
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.vercel.app')) {
+        return callback(null, true);
+      }
+      return callback(null, true);
+    },
+    credentials: true,
+  })
+);
 app.use(express.json());
 
 app.get('/health', (_req, res) => {
@@ -1528,23 +1551,58 @@ app.delete('/api/products/:id', requireAdmin, async (req, res) => {
   }
 });
 
-app.get('/api/orders', async (_req, res) => {
+app.get('/api/orders', optionalAuthenticateToken, async (req, res) => {
   try {
     const orders = await readOrders();
-    res.json(orders);
+
+    // 1. Admin gets all orders for management
+    if (req.user?.isAdmin) {
+      return res.json(orders);
+    }
+
+    // 2. Authenticated Customer receives ONLY their own orders (isolated by JWT identity)
+    if (req.user && req.user.id) {
+      const userPhoneDigits = req.user.phone ? String(req.user.phone).replace(/[^0-9]/g, '').slice(-10) : '';
+      const userEmailLower = req.user.email ? String(req.user.email).toLowerCase() : '';
+      const userId = req.user.id;
+
+      const customerOrders = orders.filter((o) => {
+        const cust = o.customer || {};
+        const orderPhoneDigits = cust.phone ? String(cust.phone).replace(/[^0-9]/g, '').slice(-10) : '';
+        const orderEmailLower = cust.email ? String(cust.email).toLowerCase() : '';
+
+        const matchesUserId = cust.userId && cust.userId === userId;
+        const matchesPhone = userPhoneDigits && orderPhoneDigits && userPhoneDigits === orderPhoneDigits;
+        const matchesEmail = userEmailLower && orderEmailLower && userEmailLower === orderEmailLower;
+
+        return matchesUserId || matchesPhone || matchesEmail;
+      });
+
+      return res.json(customerOrders);
+    }
+
+    // 3. Unauthenticated requests return empty array
+    return res.json([]);
   } catch (error) {
     console.error('Failed to read orders:', error && error.stack ? error.stack : error);
     res.status(500).json({ error: 'Unable to read orders.' });
   }
 });
 
-app.post('/api/orders', async (req, res) => {
+app.post('/api/orders', optionalAuthenticateToken, async (req, res) => {
   try {
     console.log('Received order body:', req.body);
     const order = normalizeOrderPayload(req.body || {});
     console.log('Normalized order payload:', order);
     if (!order.customer || !order.items || !Array.isArray(order.items)) {
       return res.status(400).json({ error: 'Order must include customer and items.' });
+    }
+
+    // Server attaches verified authenticated customer identity if user is logged in
+    if (req.user && !req.user.isAdmin) {
+      order.customer.userId = req.user.id;
+      if (req.user.phone) order.customer.phone = req.user.phone;
+      if (req.user.email && !order.customer.email) order.customer.email = req.user.email;
     }
 
     // Re-calculate shipping charge server-side — ignore any client-submitted value
@@ -1641,6 +1699,23 @@ function authenticateToken(req, res, next) {
     return next();
   } catch (err) {
     return res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+function optionalAuthenticateToken(req, res, next) {
+  const auth = req.headers.authorization || req.query.token || req.headers['x-access-token'];
+  if (!auth) {
+    req.user = null;
+    return next();
+  }
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : auth;
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    return next();
+  } catch (err) {
+    req.user = null;
+    return next();
   }
 }
 
