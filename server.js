@@ -5,6 +5,8 @@ import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import crypto from 'crypto';
+import nodemailer from 'nodemailer';
 import pg from 'pg';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
@@ -14,6 +16,57 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 dotenv.config({ path: path.join(__dirname, '.env') });
+
+// Email Transporter for Password Reset OTP
+async function sendPasswordResetEmail(toEmail, otpCode) {
+  const host = process.env.SMTP_HOST;
+  const port = parseInt(process.env.SMTP_PORT || '587', 10);
+  const user = process.env.SMTP_USER;
+  const pass = process.env.SMTP_PASS;
+  const from = process.env.EMAIL_FROM || '"Ruchira Pickles" <no-reply@ruchira-pickles.com>';
+
+  if (host && user && pass) {
+    try {
+      const transporter = nodemailer.createTransport({
+        host,
+        port,
+        secure: port === 465,
+        auth: { user, pass },
+      });
+
+      await transporter.sendMail({
+        from,
+        to: toEmail,
+        subject: 'Password Reset OTP — Ruchira Pickles',
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e0e0e0; border-radius: 8px;">
+            <h2 style="color: #5C4033; text-align: center;">Ruchira Pickles</h2>
+            <p>Hello,</p>
+            <p>You requested a password reset for your account. Your 6-digit verification code is:</p>
+            <div style="background-color: #F8F3E8; border: 2px dashed #5C4033; padding: 15px; text-align: center; margin: 20px 0; border-radius: 8px;">
+              <span style="font-size: 32px; font-weight: bold; letter-spacing: 6px; color: #5C4033;">${otpCode}</span>
+            </div>
+            <p>This code will expire in <strong>10 minutes</strong>. Do not share this code with anyone.</p>
+            <p style="color: #888; font-size: 12px; margin-top: 30px;">If you did not request this password reset, please ignore this email.</p>
+          </div>
+        `,
+      });
+      return true;
+    } catch (err) {
+      console.error('SMTP email dispatch error:', err.message);
+      return false;
+    }
+  }
+
+  // DEV ONLY guard: Log OTP strictly in local development mode when SMTP is missing
+  if (process.env.NODE_ENV !== 'production') {
+    console.warn(`[DEV ONLY] SMTP credentials not set. Password reset OTP for ${toEmail}: ${otpCode}`);
+    return true;
+  } else {
+    console.warn(`[PROD WARNING] SMTP credentials missing in production. Cannot send password reset OTP to ${toEmail}.`);
+    return false;
+  }
+}
 
 let firebaseAdminInitialized = false;
 try {
@@ -512,6 +565,24 @@ async function ensureDatabase() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS firebase_uid TEXT UNIQUE;
   `), 'add firebase_uid column');
   console.log('DB init: firebase_uid column ready');
+
+  console.log('DB init: creating password_reset_otps table');
+  await withDbTimeout(runQueryLogged(`
+    CREATE TABLE IF NOT EXISTS password_reset_otps (
+      id TEXT PRIMARY KEY,
+      user_id TEXT,
+      email TEXT NOT NULL,
+      otp_hash TEXT NOT NULL,
+      reset_token_hash TEXT,
+      expires_at TIMESTAMPTZ NOT NULL,
+      attempts INTEGER DEFAULT 0,
+      max_attempts INTEGER DEFAULT 5,
+      verified BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_password_reset_email ON password_reset_otps(LOWER(email));
+  `), 'create password_reset_otps');
+  console.log('DB init: password_reset_otps table ready');
 
   console.log('DB init: counting product types');
   const typeCount = await withDbTimeout(runQueryLogged('SELECT COUNT(*)::INTEGER AS count FROM product_types'), 'count product_types');
@@ -2037,10 +2108,243 @@ app.put('/api/auth/profile', authenticateToken, async (req, res) => {
   }
 });
 
-// Forgot/reset password stubs (can wire email service later)
-app.post('/api/auth/forgot', async (req, res) => {
-  // Accept email, respond success whether or not email exists to avoid leaking
-  return res.json({ success: true });
+// ----------------------------------------------------
+// EMAIL OTP FORGOT PASSWORD & PASSWORD RESET ENDPOINTS
+// ----------------------------------------------------
+
+// 1. Request Password Reset OTP
+app.post(['/api/auth/forgot-password', '/api/auth/forgot'], async (req, res) => {
+  try {
+    const { email } = req.body || {};
+    if (!email || !String(email).trim()) {
+      return res.status(400).json({ error: 'Email address is required' });
+    }
+    const cleanEmail = String(email).trim().toLowerCase();
+
+    const genericResponse = {
+      success: true,
+      message: 'If an account exists for this email, a verification code has been sent.'
+    };
+
+    let userExists = false;
+    let userId = null;
+
+    if (isPostgresEnabled && pool) {
+      const userRes = await runQueryLogged('SELECT id FROM users WHERE LOWER(email) = $1 LIMIT 1', [cleanEmail]);
+      if (userRes.rows.length > 0) {
+        userExists = true;
+        userId = userRes.rows[0].id;
+      }
+    } else {
+      await ensureStore();
+      const profiles = await readJsonFile(userProfilesFile, {});
+      if (profiles[cleanEmail]) {
+        userExists = true;
+        userId = profiles[cleanEmail].id;
+      }
+    }
+
+    if (!userExists) {
+      // Anti-enumeration: always return generic response
+      return res.json(genericResponse);
+    }
+
+    // Rate-limiting check: 60 seconds minimum between requests for same email
+    if (isPostgresEnabled && pool) {
+      const recent = await runQueryLogged(
+        "SELECT created_at FROM password_reset_otps WHERE LOWER(email) = $1 AND created_at > NOW() - INTERVAL '60 seconds' LIMIT 1",
+        [cleanEmail]
+      );
+      if (recent.rows.length > 0) {
+        return res.status(429).json({ error: 'Please wait 60 seconds before requesting another code.' });
+      }
+    }
+
+    // Generate cryptographically secure 6-digit OTP
+    const otpCode = crypto.randomInt(100000, 1000000).toString();
+    const otpHash = await bcrypt.hash(otpCode, 10);
+    const otpId = `otp_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes expiry
+
+    if (isPostgresEnabled && pool) {
+      // Invalidate existing OTPs for this email
+      await runQueryLogged('DELETE FROM password_reset_otps WHERE LOWER(email) = $1', [cleanEmail]);
+      await runQueryLogged(
+        'INSERT INTO password_reset_otps (id, user_id, email, otp_hash, expires_at) VALUES ($1, $2, $3, $4, $5)',
+        [otpId, userId, cleanEmail, otpHash, expiresAt]
+      );
+    } else {
+      await ensureStore();
+      const profiles = await readJsonFile(userProfilesFile, {});
+      if (profiles[cleanEmail]) {
+        profiles[cleanEmail].pending_otp_hash = otpHash;
+        profiles[cleanEmail].pending_otp_expires = expiresAt.toISOString();
+        profiles[cleanEmail].pending_otp_attempts = 0;
+        await writeJsonFile(userProfilesFile, profiles);
+      }
+    }
+
+    // Dispatch OTP via email helper
+    await sendPasswordResetEmail(cleanEmail, otpCode);
+
+    return res.json(genericResponse);
+  } catch (error) {
+    console.error('forgot-password error:', error);
+    return res.status(500).json({ error: 'Unable to process password reset request.' });
+  }
+});
+
+// 2. Verify Password Reset OTP
+app.post('/api/auth/verify-reset-otp', async (req, res) => {
+  try {
+    const { email, otp } = req.body || {};
+    if (!email || !otp) {
+      return res.status(400).json({ error: 'Email and 6-digit verification code are required' });
+    }
+
+    const cleanEmail = String(email).trim().toLowerCase();
+    const cleanOtp = String(otp).trim();
+
+    if (cleanOtp.length !== 6 || !/^\d{6}$/.test(cleanOtp)) {
+      return res.status(400).json({ error: 'Verification code must be 6 digits' });
+    }
+
+    if (isPostgresEnabled && pool) {
+      const { rows } = await runQueryLogged(
+        'SELECT id, otp_hash, attempts, max_attempts, expires_at FROM password_reset_otps WHERE LOWER(email) = $1 AND verified = FALSE AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1',
+        [cleanEmail]
+      );
+
+      const record = rows[0];
+      if (!record) {
+        return res.status(400).json({ error: 'Invalid or expired verification code. Please request a new code.' });
+      }
+
+      if (record.attempts >= record.max_attempts) {
+        return res.status(429).json({ error: 'Maximum verification attempts exceeded. Please request a new code.' });
+      }
+
+      // Increment attempt count
+      await runQueryLogged('UPDATE password_reset_otps SET attempts = attempts + 1 WHERE id = $1', [record.id]);
+
+      const matches = await bcrypt.compare(cleanOtp, record.otp_hash);
+      if (!matches) {
+        const remaining = record.max_attempts - (record.attempts + 1);
+        return res.status(400).json({
+          error: remaining > 0 ? `Incorrect verification code. ${remaining} attempts remaining.` : 'Maximum verification attempts exceeded. Please request a new code.'
+        });
+      }
+
+      // Generate single-use reset token
+      const rawResetToken = crypto.randomBytes(32).toString('hex');
+      const resetTokenHash = await bcrypt.hash(rawResetToken, 10);
+
+      await runQueryLogged(
+        'UPDATE password_reset_otps SET verified = TRUE, reset_token_hash = $1 WHERE id = $2',
+        [resetTokenHash, record.id]
+      );
+
+      return res.json({
+        success: true,
+        resetToken: `${record.id}:${rawResetToken}`
+      });
+    } else {
+      await ensureStore();
+      const profiles = await readJsonFile(userProfilesFile, {});
+      const p = profiles[cleanEmail];
+      if (!p || !p.pending_otp_hash || new Date(p.pending_otp_expires) < new Date()) {
+        return res.status(400).json({ error: 'Invalid or expired verification code.' });
+      }
+
+      const matches = await bcrypt.compare(cleanOtp, p.pending_otp_hash);
+      if (!matches) {
+        return res.status(400).json({ error: 'Incorrect verification code.' });
+      }
+
+      const rawResetToken = crypto.randomBytes(32).toString('hex');
+      p.reset_token_hash = await bcrypt.hash(rawResetToken, 10);
+      delete p.pending_otp_hash;
+      await writeJsonFile(userProfilesFile, profiles);
+
+      return res.json({
+        success: true,
+        resetToken: `${p.id}:${rawResetToken}`
+      });
+    }
+  } catch (error) {
+    console.error('verify-reset-otp error:', error);
+    return res.status(500).json({ error: 'Unable to verify verification code.' });
+  }
+});
+
+// 3. Reset Password with Reset Token
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const { email, resetToken, newPassword } = req.body || {};
+    if (!email || !resetToken || !newPassword) {
+      return res.status(400).json({ error: 'Missing required parameters.' });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters long.' });
+    }
+
+    const cleanEmail = String(email).trim().toLowerCase();
+    const parts = resetToken.split(':');
+    if (parts.length !== 2) {
+      return res.status(400).json({ error: 'Invalid reset session. Please request a new code.' });
+    }
+
+    const [recordId, rawToken] = parts;
+
+    if (isPostgresEnabled && pool) {
+      const { rows } = await runQueryLogged(
+        'SELECT id, reset_token_hash FROM password_reset_otps WHERE id = $1 AND LOWER(email) = $2 AND verified = TRUE AND expires_at > NOW() LIMIT 1',
+        [recordId, cleanEmail]
+      );
+
+      const record = rows[0];
+      if (!record || !record.reset_token_hash) {
+        return res.status(400).json({ error: 'Reset session expired or invalid. Please request a new verification code.' });
+      }
+
+      const validToken = await bcrypt.compare(rawToken, record.reset_token_hash);
+      if (!validToken) {
+        return res.status(400).json({ error: 'Invalid reset session.' });
+      }
+
+      // Hash new password and update user
+      const newHash = await bcrypt.hash(newPassword, 10);
+      await runQueryLogged('UPDATE users SET password_hash = $1, updated_at = NOW() WHERE LOWER(email) = $2', [newHash, cleanEmail]);
+
+      // Delete used OTP records
+      await runQueryLogged('DELETE FROM password_reset_otps WHERE LOWER(email) = $1', [cleanEmail]);
+
+      return res.json({ success: true, message: 'Password updated successfully. Please log in with your new password.' });
+    } else {
+      await ensureStore();
+      const profiles = await readJsonFile(userProfilesFile, {});
+      const p = profiles[cleanEmail];
+      if (!p || !p.reset_token_hash) {
+        return res.status(400).json({ error: 'Reset session expired or invalid.' });
+      }
+
+      const validToken = await bcrypt.compare(rawToken, p.reset_token_hash);
+      if (!validToken) {
+        return res.status(400).json({ error: 'Invalid reset session.' });
+      }
+
+      p.password_hash = await bcrypt.hash(newPassword, 10);
+      delete p.reset_token_hash;
+      p.updated_at = new Date().toISOString();
+      await writeJsonFile(userProfilesFile, profiles);
+
+      return res.json({ success: true, message: 'Password updated successfully. Please log in.' });
+    }
+  } catch (error) {
+    console.error('reset-password error:', error);
+    return res.status(500).json({ error: 'Unable to reset password.' });
+  }
 });
 
 app.post('/api/auth/reset', authenticateToken, async (req, res) => {
