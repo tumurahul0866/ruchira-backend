@@ -4,20 +4,7 @@
     "name": "Andhra Avakaya Mango Pickle",
     "category": "Veg",
     "productType": "Pickles",
-    "weights": [
-      {
-        "weight": "250g",
-        "price": 180
-      },
-      {
-        "weight": "500g",
-        "price": 340
-      },
-      {
-        "weight": "1kg",
-        "price": 620
-      }
-    ],
+    "weights": [{"weight":"250g","price":180},{"weight":"500g","price":340},{"weight":"1kg","price":620}],
     "spiceLevel": "Spicy",
     "description": "Authentic Andhra style raw mango pickle crafted with premium cold-pressed groundnut oil, Guntur red chilies, and hand-ground spices.",
     "ingredients": "Raw mango chunks, cold-pressed groundnut oil, Guntur chili powder, mustard powder, fenugreek, garlic, sea salt",
@@ -32,30 +19,14 @@
     "rating": 4.9,
     "reviewsCount": 128,
     "image": "https://images.unsplash.com/photo-1596040033229-a9821ebd058d?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80",
-    "additionalImages": [
-      "https://images.unsplash.com/photo-1596040033229-a9821ebd058d?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80",
-      "https://images.unsplash.com/photo-1604908176997-125f25cc6f3d?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80"
-    ]
+    "additionalImages": ["https://images.unsplash.com/photo-1596040033229-a9821ebd058d?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80","https://images.unsplash.com/photo-1604908176997-125f25cc6f3d?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80"]
   },
   {
     "id": "2",
     "name": "Gongura Garlic Pickle",
     "category": "Veg",
     "productType": "Pickles",
-    "weights": [
-      {
-        "weight": "250g",
-        "price": 190
-      },
-      {
-        "weight": "500g",
-        "price": 360
-      },
-      {
-        "weight": "1kg",
-        "price": 650
-      }
-    ],
+    "weights": [{"weight":"250g","price":190},{"weight":"500g","price":360},{"weight":"1kg","price":650}],
     "spiceLevel": "Extra Hot",
     "description": "Iconic Andhra sour sorrel leaves (Gongura) blended with roasted garlic cloves and roasted red chilies. A true staple of Telugu cuisine.",
     "ingredients": "Fresh Gongura leaves, whole garlic, Guntur chilies, mustard oil, coriander seeds, cumin, salt",
@@ -70,29 +41,14 @@
     "rating": 4.8,
     "reviewsCount": 94,
     "image": "https://images.unsplash.com/photo-1604908176997-125f25cc6f3d?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80",
-    "additionalImages": [
-      "https://images.unsplash.com/photo-1604908176997-125f25cc6f3d?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80"
-    ]
+    "additionalImages": ["https://images.unsplash.com/photo-1604908176997-125f25cc6f3d?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80"]
   },
   {
     "id": "3",
     "name": "Boneless Chicken Pickle",
     "category": "Non-Veg",
     "productType": "Non-Veg Pickles",
-    "weights": [
-      {
-        "weight": "250g",
-        "price": 380
-      },
-      {
-        "weight": "500g",
-        "price": 690
-      },
-      {
-        "weight": "1kg",
-        "price": 1290
-      }
-    ],
+    "weights": [{"weight":"250g","price":380},{"weight":"500g","price":690},{"weight":"1kg","price":1290}],
     "spiceLevel": "Spicy",
     "description": "Tender boneless chicken pieces fried to golden perfection, marinated in rich aromatic gravy with freshly roasted whole spices.",
     "ingredients": "Boneless chicken, groundnut oil, ginger garlic paste, chili powder, lemon juice, garam masala, salt",
@@ -107,29 +63,14 @@
     "rating": 5,
     "reviewsCount": 156,
     "image": "https://images.unsplash.com/photo-1604908176997-125f25cc6f3d?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80",
-    "additionalImages": [
-      "https://images.unsplash.com/photo-1604908176997-125f25cc6f3d?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80"
-    ]
+    "additionalImages": ["https://images.unsplash.com/photo-1604908176997-125f25cc6f3d?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80"]
   },
   {
     "id": "4",
     "name": "Spicy Royal Prawns Pickle",
     "category": "Non-Veg",
     "productType": "Non-Veg Pickles",
-    "weights": [
-      {
-        "weight": "250g",
-        "price": 440
-      },
-      {
-        "weight": "500g",
-        "price": 820
-      },
-      {
-        "weight": "1kg",
-        "price": 1550
-      }
-    ],
+    "weights": [{"weight":"250g","price":440},{"weight":"500g","price":820},{"weight":"1kg","price":1550}],
     "spiceLevel": "Spicy",
     "description": "Juicy coastal sea prawns cooked in spicy Andhra tangy gravy. Packed with intense ocean flavor and traditional spices.",
     "ingredients": "Fresh sea prawns, groundnut oil, chili powder, ginger, garlic, cloves, cinnamon, lemon concentrate",
@@ -144,29 +85,14 @@
     "rating": 4.9,
     "reviewsCount": 82,
     "image": "https://images.unsplash.com/photo-1565680018434-b513d5e5fd47?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80",
-    "additionalImages": [
-      "https://images.unsplash.com/photo-1565680018434-b513d5e5fd47?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80"
-    ]
+    "additionalImages": ["https://images.unsplash.com/photo-1565680018434-b513d5e5fd47?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80"]
   },
   {
     "id": "5",
     "name": "Andhra Mutton Pickle",
     "category": "Non-Veg",
     "productType": "Non-Veg Pickles",
-    "weights": [
-      {
-        "weight": "250g",
-        "price": 460
-      },
-      {
-        "weight": "500g",
-        "price": 860
-      },
-      {
-        "weight": "1kg",
-        "price": 1650
-      }
-    ],
+    "weights": [{"weight":"250g","price":460},{"weight":"500g","price":860},{"weight":"1kg","price":1650}],
     "spiceLevel": "Extra Hot",
     "description": "Tender boneless mutton pieces slow-cooked in cold-pressed oil and roasted spice blend. Rich, savory, and extremely delicious.",
     "ingredients": "Boneless tender mutton, groundnut oil, garlic, ginger, star anise, red chili powder, coriander, salt",
@@ -188,20 +114,7 @@
     "name": "Kandi Podi (Gunpowder)",
     "category": "Veg",
     "productType": "Podis",
-    "weights": [
-      {
-        "weight": "250g",
-        "price": 140
-      },
-      {
-        "weight": "500g",
-        "price": 260
-      },
-      {
-        "weight": "1kg",
-        "price": 490
-      }
-    ],
+    "weights": [{"weight":"250g","price":140},{"weight":"500g","price":260},{"weight":"1kg","price":490}],
     "spiceLevel": "Medium",
     "description": "Aromatic roasted toor dal powder blended with cumin seeds and red chilies. Perfectly pairs with hot rice and melted pure ghee.",
     "ingredients": "Roasted Toor Dal, Bengal Gram, Cumin seeds, Red chilies, Asafoetida, Salt",
@@ -223,20 +136,7 @@
     "name": "Karivepaku (Curry Leaf) Podi",
     "category": "Veg",
     "productType": "Podis",
-    "weights": [
-      {
-        "weight": "250g",
-        "price": 150
-      },
-      {
-        "weight": "500g",
-        "price": 280
-      },
-      {
-        "weight": "1kg",
-        "price": 520
-      }
-    ],
+    "weights": [{"weight":"250g","price":150},{"weight":"500g","price":280},{"weight":"1kg","price":520}],
     "spiceLevel": "Mild",
     "description": "Nutritious curry leaf powder enriched with iron and antioxidants. Roasted with black gram, garlic, and cumin.",
     "ingredients": "Fresh sun-dried curry leaves, Urad dal, Chana dal, Garlic, Pepper, Cumin, Tamarind, Salt",
@@ -258,20 +158,7 @@
     "name": "Allam (Ginger) Sweet & Spicy Pickle",
     "category": "Veg",
     "productType": "Pickles",
-    "weights": [
-      {
-        "weight": "250g",
-        "price": 170
-      },
-      {
-        "weight": "500g",
-        "price": 320
-      },
-      {
-        "weight": "1kg",
-        "price": 600
-      }
-    ],
+    "weights": [{"weight":"250g","price":170},{"weight":"500g","price":320},{"weight":"1kg","price":600}],
     "spiceLevel": "Medium",
     "description": "Delicious sweet & tangy ginger pickle prepared with organic jaggery and tamarind. Essential condiment for MLA Pesarattu Dosa.",
     "ingredients": "Fresh ginger, organic jaggery, tamarind extract, red chilies, mustard seeds, fenugreek, oil, salt",
@@ -293,20 +180,7 @@
     "name": "Bellam Gavvalu (Jaggery Shells)",
     "category": "Veg",
     "productType": "Sweets & Snacks",
-    "weights": [
-      {
-        "weight": "250g",
-        "price": 130
-      },
-      {
-        "weight": "500g",
-        "price": 240
-      },
-      {
-        "weight": "1kg",
-        "price": 450
-      }
-    ],
+    "weights": [{"weight":"250g","price":130},{"weight":"500g","price":240},{"weight":"1kg","price":450}],
     "spiceLevel": "Mild",
     "description": "Traditional crisp sweet shells rolled in pure cardamom-scented jaggery syrup. Crunchy, sweet, and nostalgic.",
     "ingredients": "Wheat flour, organic jaggery, cardamom powder, pure ghee, refined sunflower oil",
@@ -321,225 +195,6 @@
     "rating": 4.9,
     "reviewsCount": 88,
     "image": "https://images.unsplash.com/photo-1589301760014-d929f3979dbc?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80",
-    "additionalImages": []
-  },
-  {
-    "id": "1786010722193",
-    "name": "Test Product",
-    "category": "Veg",
-    "productType": "Pickles",
-    "weights": [
-      {
-        "weight": "250g",
-        "price": 100
-      }
-    ],
-    "spiceLevel": "Medium",
-    "description": "Test",
-    "ingredients": "x",
-    "shelfLife": "1 month",
-    "discountPrice": 0,
-    "bulkPrice": 0,
-    "stockQuantity": 5,
-    "inStock": true,
-    "bestSeller": false,
-    "newArrival": false,
-    "visible": true,
-    "rating": 0,
-    "reviewsCount": 0,
-    "image": "https://images.unsplash.com/photo-1544025162-d76694265947?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80",
-    "additionalImages": []
-  },
-  {
-    "id": "1786012340894",
-    "name": "Test Product",
-    "category": "Veg",
-    "productType": "Pickles",
-    "weights": [
-      {
-        "weight": "250g",
-        "price": 100
-      }
-    ],
-    "spiceLevel": "Medium",
-    "description": "Test product",
-    "ingredients": "test ingredients",
-    "shelfLife": "1 month",
-    "discountPrice": 0,
-    "bulkPrice": 0,
-    "stockQuantity": 5,
-    "inStock": true,
-    "bestSeller": false,
-    "newArrival": false,
-    "visible": true,
-    "rating": 0,
-    "reviewsCount": 0,
-    "image": "https://images.unsplash.com/photo-1544025162-d76694265947?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80",
-    "additionalImages": []
-  },
-  {
-    "id": "1786013056681",
-    "name": "Test Product Save Debug",
-    "category": "Veg",
-    "productType": "Pickles",
-    "weights": [
-      {
-        "weight": "250g",
-        "price": 150
-      }
-    ],
-    "spiceLevel": "Medium",
-    "description": "Debug",
-    "ingredients": "Salt",
-    "shelfLife": "6 Months",
-    "discountPrice": 0,
-    "bulkPrice": 150,
-    "stockQuantity": 10,
-    "inStock": true,
-    "visible": true,
-    "rating": 4.5,
-    "reviewsCount": 2,
-    "image": "https://images.unsplash.com/photo-1544025162-d76694265947?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80",
-    "additionalImages": [
-      "https://images.unsplash.com/photo-1544025162-d76694265947?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80"
-    ]
-  },
-  {
-    "id": "1786015795252",
-    "name": "Smoke Test Pickle",
-    "category": "Pickles",
-    "productType": "Pickles",
-    "weights": [],
-    "discountPrice": 0,
-    "bulkPrice": 0,
-    "stockQuantity": 0,
-    "inStock": false,
-    "visible": true,
-    "rating": 0,
-    "reviewsCount": 0,
-    "additionalImages": []
-  },
-  {
-    "id": "1786023964291",
-    "name": "Test Product Save",
-    "category": "Veg",
-    "productType": "Pickles",
-    "weights": [
-      {
-        "weight": "250g",
-        "price": 100
-      }
-    ],
-    "spiceLevel": "Mild",
-    "description": "Test save from API",
-    "ingredients": "Salt",
-    "shelfLife": "6 Months",
-    "discountPrice": 0,
-    "bulkPrice": 200,
-    "stockQuantity": 10,
-    "inStock": true,
-    "bestSeller": false,
-    "newArrival": false,
-    "visible": true,
-    "rating": 0,
-    "reviewsCount": 0,
-    "image": "https://images.unsplash.com/photo-1544025162-d76694265947?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80",
-    "additionalImages": []
-  },
-  {
-    "id": "1786024075108",
-    "name": "Test Product Save",
-    "category": "Veg",
-    "productType": "Pickles",
-    "weights": [
-      {
-        "weight": "250g",
-        "price": 100
-      }
-    ],
-    "spiceLevel": "Mild",
-    "description": "Test save from API",
-    "ingredients": "Salt",
-    "shelfLife": "6 Months",
-    "discountPrice": 0,
-    "bulkPrice": 200,
-    "stockQuantity": 10,
-    "inStock": true,
-    "bestSeller": false,
-    "newArrival": false,
-    "visible": true,
-    "rating": 0,
-    "reviewsCount": 0,
-    "image": "https://images.unsplash.com/photo-1544025162-d76694265947?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80",
-    "additionalImages": []
-  },
-  {
-    "id": "1786024113483",
-    "name": "Test Product Save",
-    "category": "Veg",
-    "productType": "Pickles",
-    "weights": [
-      {
-        "weight": "250g",
-        "price": 100
-      }
-    ],
-    "spiceLevel": "Mild",
-    "description": "Test save from API",
-    "ingredients": "Salt",
-    "shelfLife": "6 Months",
-    "discountPrice": 0,
-    "bulkPrice": 200,
-    "stockQuantity": 10,
-    "inStock": true,
-    "bestSeller": false,
-    "newArrival": false,
-    "visible": true,
-    "rating": 0,
-    "reviewsCount": 0,
-    "image": "https://images.unsplash.com/photo-1544025162-d76694265947?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80",
-    "additionalImages": []
-  },
-  {
-    "id": "1786025857842",
-    "name": "Local Test Save 1786025841091",
-    "category": "Veg",
-    "productType": "Pickles",
-    "weights": [
-      {
-        "weight": "250g",
-        "price": 100
-      }
-    ],
-    "spiceLevel": "Medium",
-    "description": "test",
-    "ingredients": "salt",
-    "shelfLife": "6 Months",
-    "discountPrice": 0,
-    "bulkPrice": 0,
-    "stockQuantity": 10,
-    "inStock": true,
-    "bestSeller": false,
-    "newArrival": false,
-    "visible": true,
-    "rating": 0,
-    "reviewsCount": 0,
-    "image": "https://images.unsplash.com/photo-1544025162-d76694265947?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80",
-    "additionalImages": []
-  },
-  {
-    "id": "1786026473798",
-    "name": "Smoke Test Pickle",
-    "category": "Pickles",
-    "productType": "Pickles",
-    "weights": [],
-    "discountPrice": 0,
-    "bulkPrice": 0,
-    "stockQuantity": 0,
-    "inStock": false,
-    "visible": true,
-    "rating": 0,
-    "reviewsCount": 0,
     "additionalImages": []
   }
 ]

@@ -5,7 +5,7 @@
 
 export async function sendPasswordResetOTP(toEmail, otpCode) {
   const apiKey = process.env.BREVO_API_KEY;
-  const senderEmail = process.env.BREVO_SENDER_EMAIL || 'no-reply@ruchira-pickles.com';
+  const senderEmail = process.env.BREVO_SENDER_EMAIL;
   const senderName = process.env.BREVO_SENDER_NAME || 'Ruchira Pickles';
   const maskEmail = (email) => {
     const [localPart, domain] = String(email).split('@');
@@ -20,7 +20,7 @@ export async function sendPasswordResetOTP(toEmail, otpCode) {
     recipient: maskEmail(toEmail),
   });
 
-  if (apiKey) {
+  if (apiKey && senderEmail) {
     try {
       const response = await fetch('https://api.brevo.com/v3/smtp/email', {
         method: 'POST',

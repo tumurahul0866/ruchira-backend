@@ -71,8 +71,12 @@ async function verifyFirebaseIdToken(idToken) {
   }
 }
 
-const JWT_SECRET = process.env.JWT_SECRET || 'vasuki_dev_secret';
+const JWT_SECRET = process.env.JWT_SECRET || (process.env.NODE_ENV === 'production' ? '' : crypto.randomBytes(32).toString('hex'));
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
+
+if (process.env.NODE_ENV === 'production' && !JWT_SECRET) {
+  throw new Error('JWT_SECRET must be configured in production.');
+}
 
 const isVercel =
   process.env.VERCEL === '1' ||
@@ -95,9 +99,21 @@ const productTypesFile = path.join(dataDir, 'product-types.json');
 const shippingRulesFile = path.join(dataDir, 'shipping-rules.json');
 
 const defaultCredentials = {
-  email: 'ruchira@gmail.com',
-  password: 'Admin@123',
+  email: process.env.DEFAULT_ADMIN_EMAIL || 'ruchira@gmail.com',
+  password: process.env.DEFAULT_ADMIN_PASSWORD || '',
 };
+
+const testProductIds = [
+  '1786010722193',
+  '1786012340894',
+  '1786013056681',
+  '1786015795252',
+  '1786023964291',
+  '1786024075108',
+  '1786024113483',
+  '1786025857842',
+  '1786026473798',
+];
 
 const databaseUrl = process.env.DATABASE_URL?.trim();
 const isPostgresEnabled = Boolean(databaseUrl);
@@ -115,14 +131,14 @@ async function runQueryLogged(sql, params = []) {
   }
   const start = Date.now();
   try {
-    console.log('QUERY START', { sql: sql.replace(/\s+/g, ' ').trim().slice(0,200), params });
+    console.log('QUERY START', { sql: sql.replace(/\s+/g, ' ').trim().slice(0, 200) });
     const res = await pool.query(sql, params);
     const duration = Date.now() - start;
     console.log('QUERY END', { sql: sql.replace(/\s+/g, ' ').trim().slice(0,200), duration_ms: duration, rowCount: res.rowCount });
     return res;
   } catch (err) {
     const duration = Date.now() - start;
-    console.error('QUERY ERROR', { sql: sql.replace(/\s+/g, ' ').trim().slice(0,200), params, duration_ms: duration, message: err && err.message });
+    console.error('QUERY ERROR', { sql: sql.replace(/\s+/g, ' ').trim().slice(0, 200), duration_ms: duration, message: err && err.message });
     throw err;
   }
 }
@@ -304,7 +320,9 @@ async function seedProductsFromJsonFile() {
   try {
     const raw = await fs.readFile(productsFile, 'utf8');
     const parsed = JSON.parse(raw);
-    const seedProducts = Array.isArray(parsed) ? parsed : [];
+    const seedProducts = Array.isArray(parsed)
+      ? parsed.filter((product) => !testProductIds.includes(String(product.id)))
+      : [];
 
     if (seedProducts.length === 0) {
       return;
@@ -320,6 +338,14 @@ async function seedProductsFromJsonFile() {
     }
   } catch (error) {
     console.warn('Unable to seed products from data/products.json:', error.message);
+  }
+}
+
+async function removeKnownTestProducts() {
+  if (!pool || testProductIds.length === 0) return;
+  const result = await pool.query('DELETE FROM products WHERE id = ANY($1::text[])', [testProductIds]);
+  if (result.rowCount > 0) {
+    console.info('Removed known test products from PostgreSQL', { count: result.rowCount });
   }
 }
 
@@ -559,6 +585,7 @@ async function ensureDatabase() {
   console.log('DB init: seeding products from JSON (async)');
   // Fire-and-forget seeding to avoid blocking startup
   seedProductsFromJsonFile()
+    .then(() => removeKnownTestProducts())
     .then(() => console.log('DB init: product seeding completed'))
     .catch(err => console.error('DB init: product seeding error', err));
   console.log('DB init: all init steps completed (excluding product seeding)');
@@ -1375,12 +1402,9 @@ app.get('/api/admin-credentials', requireAdmin, async (_req, res) => {
 // Admin login endpoint
 app.post('/api/admin/login', async (req, res) => {
   try {
-    console.log('ROUTE START: /api/admin/login');
     const { email, password } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
-    console.log('Before loading admin credentials');
     const creds = await readCredentials();
-    console.log('After loading admin credentials');
     const inputEmail = String(email).trim().toLowerCase();
     const storedEmail = String(creds.email || '').trim().toLowerCase();
     const storedPass = String(creds.password || '');
@@ -1388,7 +1412,6 @@ app.post('/api/admin/login', async (req, res) => {
 
     let ok = false;
     if (storedEmail === inputEmail) {
-      console.log('Before password comparison');
       if (storedPass.startsWith('$2')) {
         ok = await bcrypt.compare(password, storedPass);
       } else {
@@ -1397,10 +1420,7 @@ app.post('/api/admin/login', async (req, res) => {
           await writeCredentials({ email: creds.email, password });
         }
       }
-      console.log('After password comparison', { ok });
     }
-
-    console.log('DEBUG: admin compare', { inputEmail, storedEmail, storedPassPrefix: storedPass.slice(0, 4), ok, defaultLogin });
 
     if (!ok && defaultLogin) {
       // Restore the default admin credentials when the default admin login is used.
@@ -1409,16 +1429,132 @@ app.post('/api/admin/login', async (req, res) => {
     }
 
     if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
-    console.log('Before JWT generation');
     const token = generateToken({ id: 'admin', email: defaultLogin ? defaultCredentials.email : creds.email, name: 'Administrator', isAdmin: true, role: 'admin' });
-    console.log('After JWT generation');
-    console.log('Before res.json for admin login');
     const out = { token, email: defaultLogin ? defaultCredentials.email : creds.email, name: 'Administrator' };
     res.json(out);
-    console.log('After res.json for admin login');
   } catch (error) {
     console.error('admin login error', error);
     return res.status(500).json({ error: 'Unable to authenticate' });
+  }
+});
+
+const adminResetResponse = {
+  success: true,
+  message: 'If an account exists for this email, a verification code has been sent.',
+};
+
+app.post('/api/admin/forgot-password', async (req, res) => {
+  try {
+    const cleanEmail = String(req.body?.email || '').trim().toLowerCase();
+    if (!cleanEmail) return res.status(400).json({ error: 'Email address is required' });
+
+    const credentials = await readCredentials();
+    const adminEmail = String(credentials.email || '').trim().toLowerCase();
+    if (cleanEmail !== adminEmail) {
+      console.info('Admin password reset skipped', { result: 'admin_not_found' });
+      return res.json(adminResetResponse);
+    }
+
+    if (!isPostgresEnabled || !pool) {
+      console.warn('Admin password reset unavailable', { reason: 'storage_unavailable' });
+      return res.status(503).json({ error: 'Admin password reset is unavailable.' });
+    }
+
+    const recent = await pool.query(
+      "SELECT created_at FROM password_reset_otps WHERE user_id = 'admin' AND LOWER(email) = $1 AND created_at > NOW() - INTERVAL '60 seconds' LIMIT 1",
+      [cleanEmail]
+    );
+    if (recent.rows.length > 0) {
+      return res.status(429).json({ error: 'Please wait 60 seconds before requesting another code.' });
+    }
+
+    const otpCode = crypto.randomInt(100000, 1000000).toString();
+    const otpHash = await bcrypt.hash(otpCode, 10);
+    const otpId = `admin_otp_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+
+    await pool.query("DELETE FROM password_reset_otps WHERE user_id = 'admin' AND LOWER(email) = $1", [cleanEmail]);
+    await pool.query(
+      'INSERT INTO password_reset_otps (id, user_id, email, otp_hash, expires_at) VALUES ($1, $2, $3, $4, $5)',
+      [otpId, 'admin', cleanEmail, otpHash, expiresAt]
+    );
+
+    const emailResult = await sendPasswordResetOTP(cleanEmail, otpCode);
+    console.info('Admin password reset dispatch result', {
+      result: emailResult.reason,
+      status: emailResult.status || null,
+    });
+    return res.json(adminResetResponse);
+  } catch (error) {
+    console.error('admin forgot-password error:', error.message);
+    return res.status(500).json({ error: 'Unable to process password reset request.' });
+  }
+});
+
+app.post('/api/admin/verify-reset-otp', async (req, res) => {
+  try {
+    const cleanEmail = String(req.body?.email || '').trim().toLowerCase();
+    const cleanOtp = String(req.body?.otp || '').trim();
+    if (!cleanEmail || !/^\d{6}$/.test(cleanOtp)) {
+      return res.status(400).json({ error: 'Email and 6-digit verification code are required' });
+    }
+
+    if (!isPostgresEnabled || !pool) {
+      return res.status(503).json({ error: 'Admin password reset is unavailable.' });
+    }
+
+    const { rows } = await pool.query(
+      "SELECT id, otp_hash, attempts, max_attempts FROM password_reset_otps WHERE user_id = 'admin' AND LOWER(email) = $1 AND verified = FALSE AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1",
+      [cleanEmail]
+    );
+    const record = rows[0];
+    if (!record) return res.status(400).json({ error: 'Invalid or expired verification code.' });
+    if (record.attempts >= record.max_attempts) {
+      return res.status(429).json({ error: 'Maximum verification attempts exceeded. Please request a new code.' });
+    }
+
+    await pool.query('UPDATE password_reset_otps SET attempts = attempts + 1 WHERE id = $1', [record.id]);
+    if (!(await bcrypt.compare(cleanOtp, record.otp_hash))) {
+      return res.status(400).json({ error: 'Invalid verification code.' });
+    }
+
+    await pool.query('UPDATE password_reset_otps SET verified = TRUE WHERE id = $1', [record.id]);
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('admin verify-reset-otp error:', error.message);
+    return res.status(500).json({ error: 'Unable to verify verification code.' });
+  }
+});
+
+app.post('/api/admin/reset-password', async (req, res) => {
+  try {
+    const cleanEmail = String(req.body?.email || '').trim().toLowerCase();
+    const newPassword = String(req.body?.newPassword || '');
+    if (!cleanEmail || newPassword.length < 8) {
+      return res.status(400).json({ error: 'A new password of at least 8 characters is required.' });
+    }
+    if (!isPostgresEnabled || !pool) {
+      return res.status(503).json({ error: 'Admin password reset is unavailable.' });
+    }
+
+    const credentials = await readCredentials();
+    if (String(credentials.email || '').trim().toLowerCase() !== cleanEmail) {
+      return res.status(400).json({ error: 'Invalid reset session.' });
+    }
+
+    const { rows } = await pool.query(
+      "SELECT id FROM password_reset_otps WHERE user_id = 'admin' AND LOWER(email) = $1 AND verified = TRUE AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1",
+      [cleanEmail]
+    );
+    if (!rows[0]) return res.status(400).json({ error: 'Reset session expired or invalid.' });
+
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+    await pool.query('UPDATE admin_credentials SET password = $1, updated_at = NOW() WHERE id = (SELECT id FROM admin_credentials WHERE LOWER(email) = $2 LIMIT 1)', [passwordHash, cleanEmail]);
+    await pool.query("DELETE FROM password_reset_otps WHERE user_id = 'admin' AND LOWER(email) = $1", [cleanEmail]);
+    return res.json({ success: true, message: 'Password updated successfully. Please log in.' });
+  } catch (error) {
+    console.error('admin reset-password error:', error.message);
+    return res.status(500).json({ error: 'Unable to reset password.' });
   }
 });
 
@@ -1674,7 +1810,6 @@ app.post('/api/orders', optionalAuthenticateToken, async (req, res) => {
     res.json(nextOrder);
   } catch (error) {
     console.error('Failed to create order:', error);
-    console.error('Request body:', req.body);
     res.status(500).json({ error: 'Unable to create order.' });
   }
 });
@@ -1726,7 +1861,7 @@ function authenticateToken(req, res, next) {
     const decoded = jwt.verify(token, JWT_SECRET);
     req.user = decoded;
     return next();
-  } catch (err) {
+  } catch {
     return res.status(401).json({ error: 'Invalid token' });
   }
 }
@@ -1742,7 +1877,7 @@ function optionalAuthenticateToken(req, res, next) {
     const decoded = jwt.verify(token, JWT_SECRET);
     req.user = decoded;
     return next();
-  } catch (err) {
+  } catch {
     req.user = null;
     return next();
   }
@@ -1757,10 +1892,8 @@ app.post('/api/auth/register', async (req, res) => {
     const cleanEmail = String(email).trim().toLowerCase();
     // check existing
     if (isPostgresEnabled && pool) {
-      console.log('Before checking existing user in Postgres', cleanEmail);
       try {
         const existing = await runQueryLogged('SELECT id FROM users WHERE LOWER(email) = $1 LIMIT 1', [cleanEmail]);
-        console.log('After checking existing user', { rowCount: existing.rowCount });
         if (existing.rowCount > 0) return res.status(409).json({ error: 'Email already registered' });
       } catch (err) {
         console.error('Error while checking existing user', err && err.message);
@@ -1768,14 +1901,10 @@ app.post('/api/auth/register', async (req, res) => {
       }
 
       const id = `u${Date.now().toString().slice(-8)}`;
-      console.log('Before bcrypt password hashing');
       const hash = await bcrypt.hash(password, 10);
-      console.log('After bcrypt password hashing');
 
       try {
-        console.log('Before INSERT query for new user');
         await runQueryLogged('INSERT INTO users (id, name, email, phone, password_hash, is_admin) VALUES ($1,$2,$3,$4,$5,$6)', [id, name, cleanEmail, phone || '', hash, false]);
-        console.log('After INSERT query for new user');
       } catch (err) {
         console.error('Error during INSERT of new user', err && err.message);
         throw err;
