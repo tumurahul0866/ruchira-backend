@@ -83,12 +83,6 @@ export async function sendPasswordResetOTP(toEmail, otpCode) {
     }
   }
 
-  // DEV ONLY guard: Log OTP strictly in local development mode when BREVO_API_KEY is missing
-  if (process.env.NODE_ENV !== 'production') {
-    console.warn(`[DEV ONLY] BREVO_API_KEY not set. Password reset OTP for ${toEmail}: ${otpCode}`);
-    return true;
-  } else {
-    console.warn(`[PROD WARNING] BREVO_API_KEY missing in production. Cannot send password reset OTP to ${toEmail}.`);
-    return false;
-  }
+  console.warn('Password reset email unavailable: BREVO_API_KEY is not configured.');
+  return false;
 }

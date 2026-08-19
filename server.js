@@ -12,6 +12,10 @@ import jwt from 'jsonwebtoken';
 import admin from 'firebase-admin';
 import { sendPasswordResetOTP } from './services/emailService.js';
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+dotenv.config({ path: path.join(__dirname, '.env') });
+
 let firebaseAdminInitialized = false;
 try {
   const privateKey = process.env.FIREBASE_PRIVATE_KEY
@@ -321,7 +325,7 @@ async function seedProductsFromJsonFile() {
 
 // Ensure database tables exist and perform necessary seeding with detailed logs
 async function ensureDatabase() {
-  const DB_TIMEOUT_MS = 5000;
+  const DB_TIMEOUT_MS = 15000;
   const withDbTimeout = (promise, step) => Promise.race([
     promise,
     new Promise((_, reject) => setTimeout(() => reject(new Error(`Timeout after ${DB_TIMEOUT_MS}ms in ${step}`)), DB_TIMEOUT_MS))
@@ -794,7 +798,16 @@ const defaultOrders = [];
 const defaultReviews = [];
 const defaultOffers = [];
 const defaultStoreSettings = {};
-const defaultPaymentSettings = {};
+const defaultPaymentSettings = {
+  qrImage: 'https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=upi://pay?pa=konasemaruchulu@upi%26pn=Konasema%20Ruchulu%20Pickles',
+  upiId: 'konasemaruchulu@upi',
+  phone: '+91 8885473903',
+  enableCOD: true,
+  enableUPI: true,
+  enableScanner: true,
+  scannerNote: 'Scan the QR code using Google Pay, PhonePe, Paytm, or BHIM UPI to complete payment.',
+  instructions: 'After paying, take a screenshot and enter your transaction UTR reference number.'
+};
 const defaultAdminProfile = {};
 const defaultProductTypes = ['Pickles', 'Podis', 'Non-Veg Pickles', 'Sweets & Snacks'];
 
@@ -1100,9 +1113,10 @@ async function readPaymentSettings() {
   if (isPostgresEnabled && pool) {
     
     const { rows } = await pool.query('SELECT settings FROM payment_settings ORDER BY id LIMIT 1');
-    return rows[0]?.settings || defaultPaymentSettings;
+    return { ...defaultPaymentSettings, ...(rows[0]?.settings || {}) };
   }
-  return readJsonFile(paymentSettingsFile, defaultPaymentSettings);
+  const settings = await readJsonFile(paymentSettingsFile, defaultPaymentSettings);
+  return { ...defaultPaymentSettings, ...(settings || {}) };
 }
 
 async function writePaymentSettings(nextSettings) {
@@ -1361,7 +1375,7 @@ app.get('/api/admin-credentials', requireAdmin, async (_req, res) => {
 // Admin login endpoint
 app.post('/api/admin/login', async (req, res) => {
   try {
-    console.log('ROUTE START: /api/admin/login', { body: req.body });
+    console.log('ROUTE START: /api/admin/login');
     const { email, password } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
     console.log('Before loading admin credentials');
@@ -1606,7 +1620,7 @@ app.get('/api/orders', optionalAuthenticateToken, async (req, res) => {
 
 app.post('/api/orders', optionalAuthenticateToken, async (req, res) => {
   try {
-    console.log('Received order body:', req.body);
+    console.log('Received order request');
     const order = normalizeOrderPayload(req.body || {});
     console.log('Normalized order payload:', order);
     if (!order.customer || !order.items || !Array.isArray(order.items)) {
@@ -1737,7 +1751,7 @@ function optionalAuthenticateToken(req, res, next) {
 // Register user
 app.post('/api/auth/register', async (req, res) => {
   try {
-    console.log('ROUTE START: /api/auth/register', { isPostgresEnabled, hasPool: Boolean(pool), body: req.body });
+    console.log('ROUTE START: /api/auth/register', { isPostgresEnabled, hasPool: Boolean(pool) });
     const { name, email, phone, password } = req.body || {};
     if (!email || !password || !name) return res.status(400).json({ error: 'Missing required fields' });
     const cleanEmail = String(email).trim().toLowerCase();
@@ -2121,8 +2135,13 @@ app.post(['/api/auth/forgot-password', '/api/auth/forgot'], async (req, res) => 
       await ensureStore();
       const profiles = await readJsonFile(userProfilesFile, {});
       if (profiles[cleanEmail]) {
+        const lastRequestedAt = profiles[cleanEmail].pending_otp_created;
+        if (lastRequestedAt && Date.now() - new Date(lastRequestedAt).getTime() < 60 * 1000) {
+          return res.status(429).json({ error: 'Please wait 60 seconds before requesting another code.' });
+        }
         profiles[cleanEmail].pending_otp_hash = otpHash;
         profiles[cleanEmail].pending_otp_expires = expiresAt.toISOString();
+        profiles[cleanEmail].pending_otp_created = new Date().toISOString();
         profiles[cleanEmail].pending_otp_attempts = 0;
         await writeJsonFile(userProfilesFile, profiles);
       }
@@ -2200,14 +2219,23 @@ app.post('/api/auth/verify-reset-otp', async (req, res) => {
         return res.status(400).json({ error: 'Invalid or expired verification code.' });
       }
 
+      const attempts = Number(p.pending_otp_attempts) || 0;
+      if (attempts >= 5) {
+        return res.status(429).json({ error: 'Maximum verification attempts exceeded. Please request a new code.' });
+      }
+      p.pending_otp_attempts = attempts + 1;
+
       const matches = await bcrypt.compare(cleanOtp, p.pending_otp_hash);
       if (!matches) {
+        await writeJsonFile(userProfilesFile, profiles);
         return res.status(400).json({ error: 'Incorrect verification code.' });
       }
 
       const rawResetToken = crypto.randomBytes(32).toString('hex');
       p.reset_token_hash = await bcrypt.hash(rawResetToken, 10);
       delete p.pending_otp_hash;
+      delete p.pending_otp_attempts;
+      delete p.pending_otp_created;
       await writeJsonFile(userProfilesFile, profiles);
 
       return res.json({
