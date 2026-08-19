@@ -2104,6 +2104,7 @@ app.post(['/api/auth/forgot-password', '/api/auth/forgot'], async (req, res) => 
 
     if (!userExists) {
       // Anti-enumeration: always return generic response
+      console.info('Password reset OTP dispatch skipped', { result: 'user_not_found' });
       return res.json(genericResponse);
     }
 
@@ -2148,7 +2149,11 @@ app.post(['/api/auth/forgot-password', '/api/auth/forgot'], async (req, res) => 
     }
 
     // Dispatch OTP via Brevo email service
-    await sendPasswordResetOTP(cleanEmail, otpCode);
+    const emailResult = await sendPasswordResetOTP(cleanEmail, otpCode);
+    console.info('Password reset OTP dispatch result', {
+      result: emailResult.reason,
+      status: emailResult.status || null,
+    });
 
     return res.json(genericResponse);
   } catch (error) {

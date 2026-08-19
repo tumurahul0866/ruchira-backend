@@ -7,6 +7,18 @@ export async function sendPasswordResetOTP(toEmail, otpCode) {
   const apiKey = process.env.BREVO_API_KEY;
   const senderEmail = process.env.BREVO_SENDER_EMAIL || 'no-reply@ruchira-pickles.com';
   const senderName = process.env.BREVO_SENDER_NAME || 'Ruchira Pickles';
+  const maskEmail = (email) => {
+    const [localPart, domain] = String(email).split('@');
+    if (!localPart || !domain) return '[invalid-email]';
+    return `${localPart.slice(0, 1)}***@${domain}`;
+  };
+
+  console.info('Brevo OTP request started', {
+    BREVO_API_KEY: apiKey ? 'PRESENT' : 'MISSING',
+    BREVO_SENDER_EMAIL: process.env.BREVO_SENDER_EMAIL ? 'PRESENT' : 'MISSING',
+    sender: maskEmail(senderEmail),
+    recipient: maskEmail(toEmail),
+  });
 
   if (apiKey) {
     try {
@@ -72,17 +84,27 @@ export async function sendPasswordResetOTP(toEmail, otpCode) {
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
-        console.error('Brevo API email dispatch error:', response.status, errorData.message || errorData.code || '');
-        return false;
+        const safeMessage = String(errorData.message || errorData.code || 'Unknown Brevo error')
+          .replaceAll(apiKey, '[REDACTED]')
+          .replace(/\b\d{6}\b/g, '[REDACTED]');
+        console.error('Brevo API email dispatch rejected', {
+          status: response.status,
+          code: errorData.code || 'UNKNOWN',
+          message: safeMessage,
+        });
+        return { ok: false, reason: 'brevo_rejected', status: response.status };
       }
 
-      return true;
+      console.info('Brevo API email dispatch accepted', { status: response.status });
+      return { ok: true, reason: 'brevo_accepted', status: response.status };
     } catch (err) {
-      console.error('Brevo network dispatch error:', err.message);
-      return false;
+      console.error('Brevo network dispatch failed', {
+        message: String(err.message || 'Unknown network error').replaceAll(apiKey, '[REDACTED]'),
+      });
+      return { ok: false, reason: 'network_error' };
     }
   }
 
-  console.warn('Password reset email unavailable: BREVO_API_KEY is not configured.');
-  return false;
+  console.warn('Brevo OTP email unavailable', { reason: 'config_missing' });
+  return { ok: false, reason: 'config_missing' };
 }
