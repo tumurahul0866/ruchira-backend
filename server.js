@@ -71,11 +71,17 @@ async function verifyFirebaseIdToken(idToken) {
   }
 }
 
-const JWT_SECRET = process.env.JWT_SECRET || (process.env.NODE_ENV === 'production' ? '' : crypto.randomBytes(32).toString('hex'));
+const requiresStableJwtSecret =
+  process.env.NODE_ENV === 'production' ||
+  process.env.VERCEL === '1' ||
+  process.env.VERCEL === 'true' ||
+  Boolean(process.env.VERCEL_ENV) ||
+  Boolean(process.env.NOW_REGION);
+const JWT_SECRET = process.env.JWT_SECRET || (requiresStableJwtSecret ? '' : crypto.randomBytes(32).toString('hex'));
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
 
-if (process.env.NODE_ENV === 'production' && !JWT_SECRET) {
-  throw new Error('JWT_SECRET must be configured in production.');
+if (requiresStableJwtSecret && !JWT_SECRET) {
+  throw new Error('JWT_SECRET must be configured for production and serverless deployments.');
 }
 
 const isVercel =
@@ -341,6 +347,22 @@ async function seedProductsFromJsonFile() {
   }
 }
 
+async function seedProductsIfNeeded() {
+  if (!pool) return;
+
+  const marker = await pool.query('SELECT id FROM product_catalog_meta WHERE id = TRUE LIMIT 1');
+  if (marker.rowCount > 0) return;
+
+  const productCount = await pool.query('SELECT COUNT(*)::INTEGER AS count FROM products');
+  if (productCount.rows[0]?.count === 0) {
+    await seedProductsFromJsonFile();
+  }
+
+  await pool.query(
+    'INSERT INTO product_catalog_meta (id, initialized_at) VALUES (TRUE, NOW()) ON CONFLICT (id) DO NOTHING'
+  );
+}
+
 async function removeKnownTestProducts() {
   if (!pool || testProductIds.length === 0) return;
   const result = await pool.query('DELETE FROM products WHERE id = ANY($1::text[])', [testProductIds]);
@@ -400,6 +422,14 @@ async function ensureDatabase() {
     );
   `), 'create products');
   console.log('DB init: products table ready');
+
+  await withDbTimeout(runQueryLogged(`
+    CREATE TABLE IF NOT EXISTS product_catalog_meta (
+      id BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id = TRUE),
+      initialized_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `), 'create product_catalog_meta');
+  console.log('DB init: product catalog metadata ready');
 
   console.log('DB init: adding quantity_type column');
   await withDbTimeout(runQueryLogged(`
@@ -582,9 +612,8 @@ async function ensureDatabase() {
 
   console.log('DB init: normalizing admin credentials');
   await withDbTimeout(normalizeAdminCredentials(), 'normalize admin credentials');
-  console.log('DB init: seeding products from JSON (async)');
-  // Fire-and-forget seeding to avoid blocking startup
-  seedProductsFromJsonFile()
+  console.log('DB init: checking one-time product seed');
+  seedProductsIfNeeded()
     .then(() => removeKnownTestProducts())
     .then(() => console.log('DB init: product seeding completed'))
     .catch(err => console.error('DB init: product seeding error', err));
@@ -724,23 +753,11 @@ async function passwordsMatch(storedPassword, providedPassword) {
 async function readProducts() {
   if (isPostgresEnabled && pool) {
     try {
-      
       const { rows } = await pool.query('SELECT * FROM products ORDER BY name');
-      if (rows.length > 0) {
-        return rows.map(normalizeProduct);
-      }
-
-      const seedProducts = await readSeededProducts();
-      if (seedProducts.length > 0) {
-        try {
-          await seedProductsFromJsonFile();
-        } catch (seedError) {
-          console.warn('Failed to seed Postgres from JSON file:', seedError.message);
-        }
-        return seedProducts;
-      }
+      return rows.map(normalizeProduct);
     } catch (error) {
-      console.warn('Falling back to local products file:', error.message);
+      console.error('Failed to read products from PostgreSQL:', error.message);
+      throw error;
     }
   }
 
@@ -773,20 +790,13 @@ async function readProducts() {
 async function writeProducts(nextProducts) {
   if (isPostgresEnabled && pool) {
     try {
-      
-      // Upsert each product individually; do not use a transaction so one failure
-      // doesn't abort the entire batch. Log per-row failures and continue.
       for (const product of nextProducts) {
-        try {
-          await pool.query(productInsertQuery, productRowParams(product));
-        } catch (err) {
-          console.error('writeProducts: failed upserting product', product.id || product.name, err && err.stack ? err.stack : err);
-          // continue to next product instead of throwing to avoid wiping DB
-        }
+        await pool.query(productInsertQuery, productRowParams(product));
       }
       return nextProducts;
     } catch (error) {
-      console.warn('Database write failed, using local products file instead:', error && error.stack ? error.stack : error.message);
+      console.error('Failed to persist products to PostgreSQL:', error.message);
+      throw error;
     }
   }
 

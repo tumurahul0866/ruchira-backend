@@ -23,6 +23,7 @@ node backend/server.js
 ## Environment variables
 
 - `DATABASE_URL` — Neon Postgres connection string (DO NOT COMMIT, add to Render as a secret).
+- `JWT_SECRET` — required stable signing secret in production and Vercel/serverless deployments (add as a secret; never commit it).
 - `PORT` — optional; default is `3001`.
 
 ## Deploy to Render (recommended)
