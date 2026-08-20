@@ -109,18 +109,6 @@ const defaultCredentials = {
   password: process.env.DEFAULT_ADMIN_PASSWORD || '',
 };
 
-const testProductIds = [
-  '1786010722193',
-  '1786012340894',
-  '1786013056681',
-  '1786015795252',
-  '1786023964291',
-  '1786024075108',
-  '1786024113483',
-  '1786025857842',
-  '1786026473798',
-];
-
 const databaseUrl = process.env.DATABASE_URL?.trim();
 const isPostgresEnabled = Boolean(databaseUrl);
 const pool = isPostgresEnabled
@@ -320,58 +308,7 @@ function productRowParams(product) {
   ];
 }
 
-async function seedProductsFromJsonFile() {
-  if (!pool) return;
-
-  try {
-    const raw = await fs.readFile(productsFile, 'utf8');
-    const parsed = JSON.parse(raw);
-    const seedProducts = Array.isArray(parsed)
-      ? parsed.filter((product) => !testProductIds.includes(String(product.id)))
-      : [];
-
-    if (seedProducts.length === 0) {
-      return;
-    }
-
-    // Upsert each seed product so we don't erase admin-created products
-    for (const product of seedProducts) {
-      try {
-        await pool.query(productInsertQuery, productRowParams(normalizeProduct(product)));
-      } catch (err) {
-        console.warn('Unable to upsert seed product:', product.id || product.name, err && err.message ? err.message : err);
-      }
-    }
-  } catch (error) {
-    console.warn('Unable to seed products from data/products.json:', error.message);
-  }
-}
-
-async function seedProductsIfNeeded() {
-  if (!pool) return;
-
-  const marker = await pool.query('SELECT id FROM product_catalog_meta WHERE id = TRUE LIMIT 1');
-  if (marker.rowCount > 0) return;
-
-  const productCount = await pool.query('SELECT COUNT(*)::INTEGER AS count FROM products');
-  if (productCount.rows[0]?.count === 0) {
-    await seedProductsFromJsonFile();
-  }
-
-  await pool.query(
-    'INSERT INTO product_catalog_meta (id, initialized_at) VALUES (TRUE, NOW()) ON CONFLICT (id) DO NOTHING'
-  );
-}
-
-async function removeKnownTestProducts() {
-  if (!pool || testProductIds.length === 0) return;
-  const result = await pool.query('DELETE FROM products WHERE id = ANY($1::text[])', [testProductIds]);
-  if (result.rowCount > 0) {
-    console.info('Removed known test products from PostgreSQL', { count: result.rowCount });
-  }
-}
-
-// Ensure database tables exist and perform necessary seeding with detailed logs
+// Ensure database tables exist without changing product rows.
 async function ensureDatabase() {
   const DB_TIMEOUT_MS = 15000;
   const withDbTimeout = (promise, step) => Promise.race([
@@ -422,14 +359,6 @@ async function ensureDatabase() {
     );
   `), 'create products');
   console.log('DB init: products table ready');
-
-  await withDbTimeout(runQueryLogged(`
-    CREATE TABLE IF NOT EXISTS product_catalog_meta (
-      id BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id = TRUE),
-      initialized_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `), 'create product_catalog_meta');
-  console.log('DB init: product catalog metadata ready');
 
   console.log('DB init: adding quantity_type column');
   await withDbTimeout(runQueryLogged(`
@@ -612,12 +541,8 @@ async function ensureDatabase() {
 
   console.log('DB init: normalizing admin credentials');
   await withDbTimeout(normalizeAdminCredentials(), 'normalize admin credentials');
-  console.log('DB init: checking one-time product seed');
-  seedProductsIfNeeded()
-    .then(() => removeKnownTestProducts())
-    .then(() => console.log('DB init: product seeding completed'))
-    .catch(err => console.error('DB init: product seeding error', err));
-  console.log('DB init: all init steps completed (excluding product seeding)');
+  console.log('DB init: product rows are managed exclusively through the admin API');
+  console.log('DB init: all init steps completed');
   console.log('STARTUP: DATABASE INITIALIZATION COMPLETE');
     global.__dbInitialized = true;
 }
@@ -638,8 +563,7 @@ async function ensureStore() {
   try {
     await fs.access(productsFile);
   } catch {
-    const seedProducts = await readSeededProducts();
-    await fs.writeFile(productsFile, JSON.stringify(seedProducts, null, 2), 'utf8');
+    await fs.writeFile(productsFile, JSON.stringify([], null, 2), 'utf8');
   }
 
   await ensureJsonFile(ordersFile, defaultOrders);
@@ -766,40 +690,44 @@ async function readProducts() {
   try {
     raw = await fs.readFile(productsFile, 'utf8');
   } catch (readErr) {
-    console.warn('readProducts: unable to read products file, falling back to seeded products:', readErr && readErr.message ? readErr.message : readErr);
-    const seedProducts = await readSeededProducts();
-    try {
-      await writeJsonFile(productsFile, seedProducts);
-    } catch (writeErr) {
-      console.warn('readProducts: failed to write seeded products file:', writeErr && writeErr.message ? writeErr.message : writeErr);
-    }
-    return seedProducts;
+    console.warn('readProducts: product file is unavailable; returning an empty catalog:', readErr && readErr.message ? readErr.message : readErr);
+    return [];
   }
 
   try {
     const products = JSON.parse(raw);
     return Array.isArray(products) ? products.map(normalizeProduct) : [];
   } catch (error) {
-    console.warn('Invalid products file content, seeding from source:', error.message);
-    const seedProducts = await readSeededProducts();
-    await writeJsonFile(productsFile, seedProducts);
-    return seedProducts;
+    console.warn('Invalid products file content; returning an empty catalog:', error.message);
+    return [];
   }
 }
 
-async function writeProducts(nextProducts) {
+async function writeProduct(product) {
   if (isPostgresEnabled && pool) {
     try {
-      for (const product of nextProducts) {
-        await pool.query(productInsertQuery, productRowParams(product));
-      }
-      return nextProducts;
+      await pool.query(productInsertQuery, productRowParams(product));
+      return product;
     } catch (error) {
       console.error('Failed to persist products to PostgreSQL:', error.message);
       throw error;
     }
   }
 
+  await ensureStore();
+  const products = await readProducts();
+  const normalizedProduct = normalizeProduct(product);
+  const existingIndex = products.findIndex((item) => item.id === normalizedProduct.id);
+  if (existingIndex >= 0) {
+    products[existingIndex] = normalizedProduct;
+  } else {
+    products.push(normalizedProduct);
+  }
+  await writeJsonFile(productsFile, products);
+  return normalizedProduct;
+}
+
+async function writeProducts(nextProducts) {
   await ensureStore();
   const normalizedProducts = nextProducts.map(normalizeProduct);
   await writeJsonFile(productsFile, normalizedProducts);
@@ -903,26 +831,6 @@ const defaultShippingRules = {
     }
   }
 };
-
-const seededProductsPaths = [
-  path.join(__dirname, '..', 'data', 'products.json'),
-  path.join(__dirname, 'data', 'products.json'),
-];
-
-async function readSeededProducts() {
-  for (const seedPath of seededProductsPaths) {
-    try {
-      const raw = await fs.readFile(seedPath, 'utf8');
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        return parsed.map(normalizeProduct);
-      }
-    } catch {
-      // ignore missing or invalid seed files
-    }
-  }
-  return [];
-}
 
 async function readOrders() {
   if (isPostgresEnabled && pool) {
@@ -1660,8 +1568,12 @@ app.post('/api/products', requireAdmin, async (req, res) => {
       stockQuantity: Number(product.stockQuantity) || 0,
     };
 
-    products.push(nextProduct);
-    await writeProducts(products);
+    if (isPostgresEnabled && pool) {
+      await writeProduct(nextProduct);
+    } else {
+      products.push(nextProduct);
+      await writeProducts(products);
+    }
     res.json(nextProduct);
   } catch (error) {
     console.error('Failed to create product:', error);
@@ -1686,8 +1598,12 @@ app.put('/api/products/:id', requireAdmin, async (req, res) => {
       inStock: productUpdates.inStock !== undefined ? productUpdates.inStock : Number(productUpdates.stockQuantity ?? products[index].stockQuantity) > 0,
     };
 
-    products[index] = updatedProduct;
-    await writeProducts(products);
+    if (isPostgresEnabled && pool) {
+      await writeProduct(updatedProduct);
+    } else {
+      products[index] = updatedProduct;
+      await writeProducts(products);
+    }
     res.json(updatedProduct);
   } catch (error) {
     console.error('Failed to update product:', error);
@@ -2217,10 +2133,13 @@ app.post(['/api/auth/forgot-password', '/api/auth/forgot'], async (req, res) => 
       return res.status(400).json({ error: 'Email address is required' });
     }
     const cleanEmail = String(email).trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      return res.status(400).json({ error: 'Please enter a valid email address.' });
+    }
 
     const genericResponse = {
       success: true,
-      message: 'If an account exists for this email, a verification code has been sent.'
+      message: 'OTP sent to your registered email.'
     };
 
     let userExists = false;
@@ -2242,9 +2161,8 @@ app.post(['/api/auth/forgot-password', '/api/auth/forgot'], async (req, res) => 
     }
 
     if (!userExists) {
-      // Anti-enumeration: always return generic response
       console.info('Password reset OTP dispatch skipped', { result: 'user_not_found' });
-      return res.json(genericResponse);
+      return res.status(404).json({ error: 'There is no account with this email address.' });
     }
 
     // Rate-limiting check: 60 seconds minimum between requests for same email

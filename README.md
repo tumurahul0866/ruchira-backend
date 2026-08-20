@@ -43,7 +43,7 @@ node backend/server.js
 
 ## Smoke test (optional)
 
-- Run the smoke test script to create a product, order, and review against the running backend:
+- Run the read-only smoke test script against the running backend:
 
 ```bash
 node backend/test-smoke.js

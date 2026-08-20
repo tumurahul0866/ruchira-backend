@@ -11,29 +11,9 @@ async function req(path, opts) {
   try {
     console.log('Health ->', await req('/health'));
 
-    const product = await req('/api/products', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: 'Smoke Test Pickle', category: 'Pickles', productType: 'Pickles' })
-    });
-    console.log('Created product ->', product);
-
-    const order = await req('/api/orders', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customer: { name: 'Test', email: 'a@b.com' }, items: [{ product, quantity: 1 }], totalAmount: 0 })
-    });
-    console.log('Created order ->', order);
-
-    const review = await req('/api/reviews', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: 'Smoke', product: product.name || product.id || 'unknown', rating: 5, text: 'OK' })
-    });
-    console.log('Created review ->', review);
-
     const products = await req('/api/products');
-    console.log('Products count ->', Array.isArray(products) ? products.length : products);
+    if (!Array.isArray(products)) throw new Error('Products endpoint did not return an array');
+    console.log('Products count (read-only smoke test) ->', products.length);
   } catch (err) {
     console.error('Smoke test failed', err);
     process.exitCode = 1;
