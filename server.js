@@ -2473,12 +2473,12 @@ app.post('/api/reviews', authenticateToken, async (req, res) => {
 app.delete('/api/reviews/:id', authenticateToken, async (req, res) => {
   try {
     const reviews = await readReviews();
-    const index = reviews.findIndex((item) => item.id === req.params.id);
+    const index = reviews.findIndex((item) => String(item.id) === String(req.params.id));
     if (index < 0) return res.status(404).json({ error: 'Review not found' });
     const target = reviews[index];
     const isOwner = req.user.isAdmin || (target.user_id && target.user_id === req.user.id) || (target.user_email && target.user_email === req.user.email);
     if (!isOwner) return res.status(403).json({ error: 'Forbidden' });
-    const updated = reviews.filter((item) => item.id !== req.params.id);
+    const updated = reviews.filter((item) => String(item.id) !== String(req.params.id));
     await writeReviews(updated);
     res.json({ success: true });
   } catch (error) {
