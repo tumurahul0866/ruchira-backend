@@ -1294,7 +1294,7 @@ app.use(
       if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.vercel.app')) {
         return callback(null, true);
       }
-      return callback(null, true);
+      return callback(new Error('Origin is not allowed by CORS'));
     },
     credentials: true,
   })
@@ -2469,15 +2469,12 @@ app.post('/api/reviews', authenticateToken, async (req, res) => {
   }
 });
 
-// Delete review (auth + ownership or admin)
-app.delete('/api/reviews/:id', authenticateToken, async (req, res) => {
+// Delete review (admin only)
+app.delete('/api/reviews/:id', requireAdmin, async (req, res) => {
   try {
     const reviews = await readReviews();
     const index = reviews.findIndex((item) => String(item.id) === String(req.params.id));
     if (index < 0) return res.status(404).json({ error: 'Review not found' });
-    const target = reviews[index];
-    const isOwner = req.user.isAdmin || (target.user_id && target.user_id === req.user.id) || (target.user_email && target.user_email === req.user.email);
-    if (!isOwner) return res.status(403).json({ error: 'Forbidden' });
     const updated = reviews.filter((item) => String(item.id) !== String(req.params.id));
     await writeReviews(updated);
     res.json({ success: true });
