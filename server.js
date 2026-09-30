@@ -945,12 +945,12 @@ async function readReviews() {
 
 async function writeReviews(nextReviews) {
   if (isPostgresEnabled && pool) {
-    
-    await pool.query('BEGIN');
+    const client = await pool.connect();
     try {
-      await pool.query('DELETE FROM reviews');
+      await client.query('BEGIN');
+      await client.query('DELETE FROM reviews');
       for (const review of nextReviews) {
-        await pool.query(
+        await client.query(
           `INSERT INTO reviews (id, name, product, rating, date, text, visible, verified_buyer, user_id, user_email, user_name, created_at, updated_at)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
           [
@@ -970,11 +970,13 @@ async function writeReviews(nextReviews) {
           ]
         );
       }
-      await pool.query('COMMIT');
+      await client.query('COMMIT');
       return nextReviews;
     } catch (error) {
-      await pool.query('ROLLBACK');
+      await client.query('ROLLBACK');
       throw error;
+    } finally {
+      client.release();
     }
   }
   return writeJsonFile(reviewsFile, nextReviews);
