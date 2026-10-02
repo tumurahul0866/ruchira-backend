@@ -179,7 +179,14 @@ function withComboProductDetails(products, sourceProducts = products) {
       comboProducts: comboProductIds
         .map((id) => sourceProducts.find((candidate) => String(candidate.id) === String(id)))
         .filter(Boolean)
-        .map(({ id, name, image }) => ({ id, name, image: image || '', quantity: 1 })),
+        .map(({ id, name, image, productType, category }) => ({
+          id,
+          name,
+          image: image || '',
+          productType: productType || 'Product',
+          category: category || '',
+          quantity: 1,
+        })),
     };
   });
 }
@@ -2064,6 +2071,8 @@ app.post('/api/orders', orderRateLimiter, optionalAuthenticateToken, async (req,
               id: comboProduct.id,
               name: comboProduct.name,
               image: comboProduct.image || '',
+              productType: comboProduct.productType || 'Product',
+              category: comboProduct.category || '',
               quantity: 1,
             })),
           } : {}),
