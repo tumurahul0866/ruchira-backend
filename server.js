@@ -2921,6 +2921,9 @@ app.post('/api/store-settings', requireAdmin, async (req, res) => {
         (settings.heroMobileImageUrl !== undefined && !isSafeImageUrl(settings.heroMobileImageUrl)) ||
         (settings.heroTitle !== undefined && (typeof settings.heroTitle !== 'string' || settings.heroTitle.length > 100)) ||
         (settings.heroSubtitle !== undefined && (typeof settings.heroSubtitle !== 'string' || settings.heroSubtitle.length > 300)) ||
+        (settings.logoZoom !== undefined && (typeof settings.logoZoom !== 'number' || !Number.isFinite(settings.logoZoom) || settings.logoZoom < 1 || settings.logoZoom > 3)) ||
+        (settings.logoPositionX !== undefined && (typeof settings.logoPositionX !== 'number' || !Number.isFinite(settings.logoPositionX) || settings.logoPositionX < 0 || settings.logoPositionX > 100)) ||
+        (settings.logoPositionY !== undefined && (typeof settings.logoPositionY !== 'number' || !Number.isFinite(settings.logoPositionY) || settings.logoPositionY < 0 || settings.logoPositionY > 100)) ||
         (settings.heroGradientOverlay !== undefined && typeof settings.heroGradientOverlay !== 'boolean') ||
         (settings.address !== undefined && (typeof settings.address !== 'string' || settings.address.length > 500))) {
       return res.status(400).json({ error: 'Enter valid store settings.' });
