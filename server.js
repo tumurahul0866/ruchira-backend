@@ -9,67 +9,11 @@ import crypto from 'crypto';
 import pg from 'pg';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
-import admin from 'firebase-admin';
 import { sendPasswordResetOTP } from './services/emailService.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.join(__dirname, '.env') });
-
-let firebaseAdminInitialized = false;
-try {
-  const privateKey = process.env.FIREBASE_PRIVATE_KEY
-    ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n')
-    : undefined;
-
-  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
-    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
-    if (!admin.apps.length) {
-      admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount)
-      });
-    }
-    firebaseAdminInitialized = true;
-    console.log('Firebase Admin initialized from FIREBASE_SERVICE_ACCOUNT_JSON');
-  } else if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && privateKey) {
-    if (!admin.apps.length) {
-      admin.initializeApp({
-        credential: admin.credential.cert({
-          projectId: process.env.FIREBASE_PROJECT_ID,
-          clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-          privateKey: privateKey,
-        })
-      });
-    }
-    firebaseAdminInitialized = true;
-    console.log('Firebase Admin initialized from environment variables');
-  } else {
-    console.warn('Firebase Admin credentials not set in environment. Set FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY.');
-  }
-} catch (err) {
-  console.error('Firebase Admin initialization error:', err.message);
-}
-
-async function verifyFirebaseIdToken(idToken) {
-  if (!idToken) throw new Error('Token is required');
-  if (firebaseAdminInitialized) {
-    const decodedToken = await admin.auth().verifyIdToken(idToken);
-    return decodedToken;
-  } else {
-    if (process.env.NODE_ENV !== 'production' || process.env.ALLOW_UNVERIFIED_DEV_TOKENS === 'true') {
-      console.warn('DEV WARNING: Firebase Admin not initialized. Decoding unverified token for local dev testing.');
-      const decoded = jwt.decode(idToken);
-      if (decoded && (decoded.sub || decoded.user_id || decoded.uid)) {
-        return {
-          uid: decoded.user_id || decoded.sub || decoded.uid,
-          phone_number: decoded.phone_number || decoded.phone || '+919999999999',
-          email: decoded.email
-        };
-      }
-    }
-    throw new Error('Firebase Admin SDK is not initialized on the server.');
-  }
-}
 
 const requiresStableJwtSecret =
   process.env.NODE_ENV === 'production' ||
@@ -485,19 +429,12 @@ async function ensureDatabase() {
       email TEXT UNIQUE,
       phone TEXT,
       password_hash TEXT,
-      firebase_uid TEXT UNIQUE,
       is_admin BOOLEAN DEFAULT FALSE,
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
   `), 'create users');
   console.log('DB init: users table ready');
-
-  console.log('DB init: adding firebase_uid column to users');
-  await withDbTimeout(runQueryLogged(`
-    ALTER TABLE users ADD COLUMN IF NOT EXISTS firebase_uid TEXT UNIQUE;
-  `), 'add firebase_uid column');
-  console.log('DB init: firebase_uid column ready');
 
   console.log('DB init: creating password_reset_otps table');
   await withDbTimeout(runQueryLogged(`
@@ -1892,169 +1829,6 @@ app.post('/api/auth/login', async (req, res) => {
   } catch (error) {
     console.error('login error', error);
     res.status(500).json({ error: 'Unable to login' });
-  }
-});
-
-// Phone + OTP Login via verified Firebase Token
-app.post('/api/auth/phone-login', async (req, res) => {
-  try {
-    const authHeader = req.headers.authorization || '';
-    const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : (req.body.idToken || req.body.token);
-
-    if (!idToken) {
-      return res.status(401).json({ error: 'Authentication token required' });
-    }
-
-    const decoded = await verifyFirebaseIdToken(idToken);
-    const firebaseUid = decoded.uid;
-    const rawPhone = decoded.phone_number || req.body.phone;
-
-    if (!rawPhone) {
-      return res.status(400).json({ error: 'Verified phone number missing from authentication token' });
-    }
-
-    const cleanPhone = String(rawPhone).trim().replace(/\s+/g, '');
-    const digitsOnly = cleanPhone.replace(/^\+91/, '').replace(/[^0-9]/g, '');
-    const fullE164 = cleanPhone.startsWith('+') ? cleanPhone : `+91${digitsOnly}`;
-
-    const { name, email } = req.body || {};
-    const cleanEmail = email ? String(email).trim().toLowerCase() : null;
-
-    if (isPostgresEnabled && pool) {
-      // 1. Try to find user by firebase_uid
-      let userRes = await runQueryLogged('SELECT id, name, email, phone, firebase_uid, is_admin FROM users WHERE firebase_uid = $1 LIMIT 1', [firebaseUid]);
-      let user = userRes.rows[0];
-
-      // 2. If not found by firebase_uid, try matching by phone number
-      if (!user) {
-        userRes = await runQueryLogged(
-          'SELECT id, name, email, phone, firebase_uid, is_admin FROM users WHERE phone = $1 OR phone = $2 LIMIT 1',
-          [fullE164, digitsOnly]
-        );
-        user = userRes.rows[0];
-        
-        if (user) {
-          // Link firebase_uid to existing user
-          await runQueryLogged('UPDATE users SET firebase_uid = $1, updated_at = NOW() WHERE id = $2', [firebaseUid, user.id]);
-          user.firebase_uid = firebaseUid;
-        }
-      }
-
-      // 3. Existing customer found
-      if (user) {
-        if (name && (!user.name || user.name === 'Customer')) {
-          await runQueryLogged('UPDATE users SET name = $1, email = COALESCE(email, $2), updated_at = NOW() WHERE id = $3', [name, cleanEmail, user.id]);
-          user.name = name;
-          if (cleanEmail) user.email = cleanEmail;
-        }
-
-        const appToken = generateToken({
-          id: user.id,
-          email: user.email || '',
-          phone: user.phone || fullE164,
-          name: user.name || 'Customer',
-          isAdmin: Boolean(user.is_admin)
-        });
-
-        return res.json({
-          isNewUser: false,
-          user: {
-            id: user.id,
-            name: user.name || 'Customer',
-            email: user.email || '',
-            phone: user.phone || fullE164,
-            isAdmin: Boolean(user.is_admin)
-          },
-          token: appToken
-        });
-      }
-
-      // 4. Customer does NOT exist: check if profile name was provided
-      if (!name || !String(name).trim()) {
-        return res.json({
-          isNewUser: true,
-          phone: fullE164,
-          message: 'Profile completion required'
-        });
-      }
-
-      // Create new customer account in Postgres
-      const newId = `u${Date.now().toString().slice(-8)}`;
-      await runQueryLogged(
-        'INSERT INTO users (id, name, email, phone, firebase_uid, is_admin) VALUES ($1, $2, $3, $4, $5, $6)',
-        [newId, String(name).trim(), cleanEmail || null, fullE164, firebaseUid, false]
-      );
-
-      const appToken = generateToken({
-        id: newId,
-        email: cleanEmail || '',
-        phone: fullE164,
-        name: String(name).trim(),
-        isAdmin: false
-      });
-
-      return res.json({
-        isNewUser: false,
-        user: {
-          id: newId,
-          name: String(name).trim(),
-          email: cleanEmail || '',
-          phone: fullE164,
-          isAdmin: false
-        },
-        token: appToken
-      });
-    }
-
-    // JSON fallback store implementation
-    await ensureStore();
-    const profiles = await readJsonFile(userProfilesFile, {});
-    
-    let profileKey = Object.keys(profiles).find(
-      (k) => profiles[k].firebase_uid === firebaseUid || profiles[k].phone === fullE164 || profiles[k].phone === digitsOnly
-    );
-
-    if (profileKey) {
-      const p = profiles[profileKey];
-      p.firebase_uid = firebaseUid;
-      if (name && !p.name) p.name = name;
-      if (cleanEmail && !p.email) p.email = cleanEmail;
-      await writeJsonFile(userProfilesFile, profiles);
-
-      const appToken = generateToken({ id: p.id, email: p.email || '', phone: p.phone || fullE164, name: p.name || 'Customer', isAdmin: false });
-      return res.json({
-        isNewUser: false,
-        user: { id: p.id, name: p.name || 'Customer', email: p.email || '', phone: p.phone || fullE164, isAdmin: false },
-        token: appToken
-      });
-    }
-
-    if (!name || !String(name).trim()) {
-      return res.json({ isNewUser: true, phone: fullE164, message: 'Profile completion required' });
-    }
-
-    const newId = `u${Date.now().toString().slice(-8)}`;
-    const storeKey = cleanEmail || `phone_${digitsOnly}`;
-    profiles[storeKey] = {
-      id: newId,
-      name: String(name).trim(),
-      email: cleanEmail || '',
-      phone: fullE164,
-      firebase_uid: firebaseUid,
-      created_at: new Date().toISOString()
-    };
-    await writeJsonFile(userProfilesFile, profiles);
-
-    const appToken = generateToken({ id: newId, email: cleanEmail || '', phone: fullE164, name: String(name).trim(), isAdmin: false });
-    return res.json({
-      isNewUser: false,
-      user: { id: newId, name: String(name).trim(), email: cleanEmail || '', phone: fullE164, isAdmin: false },
-      token: appToken
-    });
-
-  } catch (error) {
-    console.error('phone-login error:', error);
-    return res.status(401).json({ error: error.message || 'Authentication failed' });
   }
 });
 
