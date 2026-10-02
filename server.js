@@ -819,10 +819,10 @@ function deepParseJsonValue(value) {
 async function writeOrders(nextOrders) {
   if (isPostgresEnabled && pool) {
     console.log('writeOrders: using Postgres path; order count =', Array.isArray(nextOrders) ? nextOrders.length : 0);
+    const client = await pool.connect();
     try {
-      
-      await pool.query('BEGIN');
-      await pool.query('DELETE FROM orders');
+      await client.query('BEGIN');
+      await client.query('DELETE FROM orders');
       for (const order of nextOrders) {
         try {
           const customerValue = deepParseJsonValue(order.customer || {});
@@ -830,7 +830,7 @@ async function writeOrders(nextOrders) {
           const customerJson = typeof customerValue === 'string' ? JSON.parse(customerValue) : customerValue;
           const itemsJson = typeof itemsValue === 'string' ? JSON.parse(itemsValue) : itemsValue;
 
-          await pool.query(
+          await client.query(
             `INSERT INTO orders (id, date, status, payment_status, payment_method, total_amount, tracking_number, customer, items)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
             [
@@ -850,16 +850,18 @@ async function writeOrders(nextOrders) {
           throw rowError;
         }
       }
-      await pool.query('COMMIT');
+      await client.query('COMMIT');
       return nextOrders;
     } catch (error) {
       try {
-        await pool.query('ROLLBACK');
+        await client.query('ROLLBACK');
       } catch (rbErr) {
         console.error('writeOrders: rollback failed:', rbErr && rbErr.stack ? rbErr.stack : rbErr);
       }
-      console.error('writeOrders: Database order write failed, falling back to local file. Error:', error && error.stack ? error.stack : error);
-      return writeJsonFile(ordersFile, nextOrders);
+      console.error('writeOrders: Database order write failed:', error && error.stack ? error.stack : error);
+      throw error;
+    } finally {
+      client.release();
     }
   }
 
@@ -948,12 +950,12 @@ async function readOffers() {
 
 async function writeOffers(nextOffers) {
   if (isPostgresEnabled && pool) {
-    
-    await pool.query('BEGIN');
+    const client = await pool.connect();
     try {
-      await pool.query('DELETE FROM offers');
+      await client.query('BEGIN');
+      await client.query('DELETE FROM offers');
       for (const offer of nextOffers) {
-        await pool.query(
+        await client.query(
           `INSERT INTO offers (id, code, title, description, discount, active, product_id, min_order_value)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
           [
@@ -968,11 +970,13 @@ async function writeOffers(nextOffers) {
           ]
         );
       }
-      await pool.query('COMMIT');
+      await client.query('COMMIT');
       return nextOffers;
     } catch (error) {
-      await pool.query('ROLLBACK');
+      await client.query('ROLLBACK');
       throw error;
+    } finally {
+      client.release();
     }
   }
   return writeJsonFile(offersFile, nextOffers);
@@ -1745,8 +1749,19 @@ app.put('/api/orders/:id', requireAdmin, async (req, res) => {
 
 app.delete('/api/orders/:id', requireAdmin, async (req, res) => {
   try {
+    if (isPostgresEnabled && pool) {
+      const { rowCount } = await pool.query('DELETE FROM orders WHERE id = $1', [req.params.id]);
+      if (rowCount === 0) {
+        return res.status(404).json({ error: 'Order not found.' });
+      }
+      return res.json({ success: true });
+    }
+
     const orders = await readOrders();
-    const updatedOrders = orders.filter((item) => item.id !== req.params.id);
+    const updatedOrders = orders.filter((item) => String(item.id) !== req.params.id);
+    if (updatedOrders.length === orders.length) {
+      return res.status(404).json({ error: 'Order not found.' });
+    }
     await writeOrders(updatedOrders);
     res.json({ success: true });
   } catch (error) {
