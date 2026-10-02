@@ -1264,6 +1264,7 @@ const app = express();
 app.set('trust proxy', 1);
 
 const allowedOrigins = new Set([
+  'https://jdfoods.vercel.app',
   'https://ruchira-pickels.vercel.app',
   ...(process.env.NODE_ENV === 'production'
     ? []
