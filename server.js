@@ -1667,9 +1667,7 @@ app.get('/api/orders', optionalAuthenticateToken, async (req, res) => {
 
 app.post('/api/orders', optionalAuthenticateToken, async (req, res) => {
   try {
-    console.log('Received order request');
     const order = normalizeOrderPayload(req.body || {});
-    console.log('Normalized order payload:', order);
     if (!order.customer || !order.items || !Array.isArray(order.items)) {
       return res.status(400).json({ error: 'Order must include customer and items.' });
     }
@@ -1696,7 +1694,6 @@ app.post('/api/orders', optionalAuthenticateToken, async (req, res) => {
     }
     const verifiedTotal = itemsSubtotal + verifiedShippingCharge;
 
-    const existingOrders = await readOrders();
     const nextOrder = {
       ...order,
       id: order.id || `ORD${Date.now().toString().slice(-8)}`,
@@ -1716,8 +1713,27 @@ app.post('/api/orders', optionalAuthenticateToken, async (req, res) => {
       },
     };
 
-    existingOrders.unshift(nextOrder);
-    await writeOrders(existingOrders);
+    if (isPostgresEnabled && pool) {
+      await pool.query(
+        `INSERT INTO orders (id, date, status, payment_status, payment_method, total_amount, tracking_number, customer, items)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          nextOrder.id,
+          nextOrder.date,
+          nextOrder.status,
+          nextOrder.paymentStatus,
+          nextOrder.paymentMethod,
+          nextOrder.totalAmount,
+          nextOrder.trackingNumber,
+          JSON.stringify(nextOrder.customer),
+          JSON.stringify(nextOrder.items),
+        ]
+      );
+    } else {
+      const existingOrders = await readOrders();
+      existingOrders.unshift(nextOrder);
+      await writeOrders(existingOrders);
+    }
     res.json(nextOrder);
   } catch (error) {
     console.error('Failed to create order:', error);
