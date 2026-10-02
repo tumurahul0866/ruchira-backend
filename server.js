@@ -2217,36 +2217,75 @@ app.get('/api/reviews', async (_req, res) => {
 app.post('/api/reviews', authenticateToken, async (req, res) => {
   try {
     const review = req.body || {};
+    const product = String(review.product || '').trim();
+    const text = String(review.text || '').trim();
+    const rating = Number(review.rating);
+    if (!product) return res.status(400).json({ error: 'Select a product before submitting your review.' });
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+      return res.status(400).json({ error: 'Rating must be between 1 and 5 stars.' });
+    }
+    if (!text) return res.status(400).json({ error: 'Write your review before submitting.' });
+
     const reviews = await readReviews();
     const userId = req.user.id;
     const userEmail = req.user.email;
     const userName = req.user.name || req.user.email;
 
-    // Prevent duplicate review by same user for same product
-    const exists = reviews.find((r) => r.product === review.product && (r.user_id === userId || r.user_email === userEmail));
+    const normalizedProduct = product.toLocaleLowerCase();
+    const normalizedEmail = String(userEmail || '').toLocaleLowerCase();
+    const exists = reviews.find((existingReview) => (
+      String(existingReview.product || '').trim().toLocaleLowerCase() === normalizedProduct &&
+      (
+        (userId && String(existingReview.user_id || '') === String(userId)) ||
+        (normalizedEmail && String(existingReview.user_email || '').toLocaleLowerCase() === normalizedEmail)
+      )
+    ));
     if (exists) {
       return res.status(409).json({ error: 'User has already reviewed this product' });
     }
 
     const now = new Date().toISOString();
     const nextReview = {
-      ...review,
-      id: review.id || `r${Date.now().toString().slice(-8)}`,
+      id: crypto.randomUUID(),
       name: userName,
-      product: review.product || '',
-      rating: Number(review.rating) || 5,
+      product,
+      rating,
       date: now,
-      visible: review.visible !== undefined ? review.visible : true,
-      verifiedBuyer: review.verifiedBuyer !== undefined ? review.verifiedBuyer : true,
-      text: review.text || '',
+      visible: true,
+      verifiedBuyer: true,
+      text,
       user_id: userId,
       user_email: userEmail,
       user_name: userName,
       created_at: now,
       updated_at: now,
     };
-    reviews.unshift(nextReview);
-    await writeReviews(reviews);
+
+    if (isPostgresEnabled && pool) {
+      await pool.query(
+        `INSERT INTO reviews (id, name, product, rating, date, text, visible, verified_buyer, user_id, user_email, user_name, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+        [
+          nextReview.id,
+          nextReview.name,
+          nextReview.product,
+          nextReview.rating,
+          nextReview.date,
+          nextReview.text,
+          nextReview.visible,
+          nextReview.verifiedBuyer,
+          nextReview.user_id || null,
+          nextReview.user_email || null,
+          nextReview.user_name || null,
+          nextReview.created_at,
+          nextReview.updated_at,
+        ]
+      );
+    } else {
+      reviews.unshift(nextReview);
+      await writeReviews(reviews);
+    }
+
     res.json(nextReview);
   } catch (error) {
     console.error('Failed to create review:', error);
