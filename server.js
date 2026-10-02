@@ -1284,7 +1284,7 @@ app.put(
   }
 );
 
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
@@ -1727,9 +1727,54 @@ app.post('/api/orders', optionalAuthenticateToken, async (req, res) => {
 
 app.put('/api/orders/:id', requireAdmin, async (req, res) => {
   try {
-    const updates = req.body || {};
+    const body = req.body || {};
+    const updates = {};
+    if (body.status !== undefined) {
+      if (typeof body.status !== 'string' || !body.status.trim()) {
+        return res.status(400).json({ error: 'A valid order status is required.' });
+      }
+      updates.status = body.status;
+    }
+    if (body.paymentStatus !== undefined) {
+      if (typeof body.paymentStatus !== 'string' || !body.paymentStatus.trim()) {
+        return res.status(400).json({ error: 'A valid payment status is required.' });
+      }
+      updates.paymentStatus = body.paymentStatus;
+    }
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'No order updates were provided.' });
+    }
+
+    if (isPostgresEnabled && pool) {
+      const columns = { status: 'status', paymentStatus: 'payment_status' };
+      const fields = Object.keys(updates);
+      const assignments = fields.map((field, index) => `${columns[field]} = $${index + 1}`);
+      const values = fields.map((field) => updates[field]);
+      values.push(req.params.id);
+      const { rows } = await pool.query(
+        `UPDATE orders SET ${assignments.join(', ')} WHERE id = $${values.length} RETURNING *`,
+        values
+      );
+      if (rows.length === 0) {
+        return res.status(404).json({ error: 'Order not found.' });
+      }
+
+      const row = rows[0];
+      return res.json({
+        id: row.id,
+        date: row.date,
+        status: row.status,
+        paymentStatus: row.payment_status,
+        paymentMethod: row.payment_method,
+        totalAmount: Number(row.total_amount),
+        trackingNumber: row.tracking_number,
+        customer: row.customer || {},
+        items: row.items || [],
+      });
+    }
+
     const orders = await readOrders();
-    const index = orders.findIndex((item) => item.id === req.params.id);
+    const index = orders.findIndex((item) => String(item.id) === req.params.id);
     if (index < 0) {
       return res.status(404).json({ error: 'Order not found.' });
     }
@@ -1737,7 +1782,6 @@ app.put('/api/orders/:id', requireAdmin, async (req, res) => {
     orders[index] = {
       ...orders[index],
       ...updates,
-      id: req.params.id,
     };
     await writeOrders(orders);
     res.json(orders[index]);
