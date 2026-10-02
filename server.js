@@ -194,6 +194,9 @@ function withComboProductDetails(products, sourceProducts = products) {
 function normalizeProductInput(item) {
   return {
     ...item,
+    comboProductIds: Array.isArray(item.comboProductIds ?? item.combo_product_ids)
+      ? (item.comboProductIds ?? item.combo_product_ids).map(String)
+      : [],
     quantityType: item.quantityType ?? item.quantity_type ?? 'Weight',
     pricePerUnit: Number(item.pricePerUnit ?? item.price_per_unit) || 0,
     weights: Array.isArray(item.weights) ? item.weights : [],
