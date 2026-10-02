@@ -2917,6 +2917,10 @@ app.post('/api/store-settings', requireAdmin, async (req, res) => {
         (settings.logoUrl !== undefined && !isSafeImageUrl(settings.logoUrl)) ||
         (settings.heroBackgroundUrl !== undefined && !isSafeImageUrl(settings.heroBackgroundUrl)) ||
         (settings.featureImageUrl !== undefined && !isSafeImageUrl(settings.featureImageUrl)) ||
+        (settings.heroDesktopImageUrl !== undefined && !isSafeImageUrl(settings.heroDesktopImageUrl)) ||
+        (settings.heroMobileImageUrl !== undefined && !isSafeImageUrl(settings.heroMobileImageUrl)) ||
+        (settings.heroTitle !== undefined && (typeof settings.heroTitle !== 'string' || settings.heroTitle.length > 100)) ||
+        (settings.heroSubtitle !== undefined && (typeof settings.heroSubtitle !== 'string' || settings.heroSubtitle.length > 300)) ||
         (settings.address !== undefined && (typeof settings.address !== 'string' || settings.address.length > 500))) {
       return res.status(400).json({ error: 'Enter valid store settings.' });
     }
