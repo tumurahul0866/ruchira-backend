@@ -1,6 +1,6 @@
 # Backend (Express) — Deploy & Local Run
 
-This folder contains the Express backend for Vasuki Pickles. It supports PostgreSQL (Neon) via `DATABASE_URL` and falls back to local JSON files when `DATABASE_URL` is not set.
+This folder contains the Express backend for J&D Foods. It supports PostgreSQL (Neon) via `DATABASE_URL` and falls back to local JSON files when `DATABASE_URL` is not set.
 
 ## Local development
 
