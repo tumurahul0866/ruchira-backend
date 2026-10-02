@@ -99,6 +99,7 @@ const PRODUCT_COLUMNS = [
   'image',
   'additional_images',
   'combo_product_ids',
+  'combo_product_quantities',
 ];
 
 const productInsertQuery = `
@@ -126,7 +127,8 @@ const productInsertQuery = `
     reviews_count = EXCLUDED.reviews_count,
     image = EXCLUDED.image,
     additional_images = EXCLUDED.additional_images,
-    combo_product_ids = EXCLUDED.combo_product_ids;
+    combo_product_ids = EXCLUDED.combo_product_ids,
+    combo_product_quantities = EXCLUDED.combo_product_quantities;
 `;
 
 function parseJsonValue(value) {
@@ -142,6 +144,7 @@ function normalizeProduct(product) {
   const weights = parseJsonValue(product.weights);
   const additionalImages = parseJsonValue(product.additionalImages ?? product.additional_images);
   const comboProductIds = parseJsonValue(product.comboProductIds ?? product.combo_product_ids);
+  const comboProductQuantities = parseJsonValue(product.comboProductQuantities ?? product.combo_product_quantities);
 
   return {
     id: product.id,
@@ -167,7 +170,18 @@ function normalizeProduct(product) {
     image: product.image,
     additionalImages: Array.isArray(additionalImages) ? additionalImages : [],
     comboProductIds: Array.isArray(comboProductIds) ? comboProductIds : [],
+    comboProductQuantities: comboProductQuantities && typeof comboProductQuantities === 'object' && !Array.isArray(comboProductQuantities)
+      ? comboProductQuantities
+      : {},
   };
+}
+
+function getComboProductUnit(product) {
+  const quantityType = String(product.quantityType || product.quantity_type || '').toLowerCase();
+  const firstVariantLabel = String(product.weights?.[0]?.weight ?? product.weights?.[0]?.label ?? '').toLowerCase();
+  if (/\b(weight|g|gram|grams|kg|kilogram|kilograms)\b|(?:\d)\s*(?:g|kg)\b/.test(`${quantityType} ${firstVariantLabel}`)) return 'g';
+  if (/\b(volume|ml|milliliter|milliliters|l|liter|liters)\b|(?:\d)\s*(?:ml|l)\b/.test(`${quantityType} ${firstVariantLabel}`)) return 'ml';
+  return 'units';
 }
 
 function withComboProductDetails(products, sourceProducts = products) {
@@ -179,13 +193,15 @@ function withComboProductDetails(products, sourceProducts = products) {
       comboProducts: comboProductIds
         .map((id) => sourceProducts.find((candidate) => String(candidate.id) === String(id)))
         .filter(Boolean)
-        .map(({ id, name, image, productType, category }) => ({
-          id,
-          name,
-          image: image || '',
-          productType: productType || 'Product',
-          category: category || '',
-          quantity: 1,
+        .map((comboProduct) => ({
+          id: comboProduct.id,
+          name: comboProduct.name,
+          image: comboProduct.image || '',
+          productType: comboProduct.productType || 'Product',
+          category: comboProduct.category || '',
+          price: Number(comboProduct.pricePerUnit) || Number(comboProduct.weights?.[0]?.price) || 0,
+          quantity: Number(product.comboProductQuantities?.[String(comboProduct.id)]) || 1,
+          unit: getComboProductUnit(comboProduct),
         })),
     };
   });
@@ -197,6 +213,11 @@ function normalizeProductInput(item) {
     comboProductIds: Array.isArray(item.comboProductIds ?? item.combo_product_ids)
       ? (item.comboProductIds ?? item.combo_product_ids).map(String)
       : [],
+    comboProductQuantities: item.comboProductQuantities && typeof item.comboProductQuantities === 'object' && !Array.isArray(item.comboProductQuantities)
+      ? item.comboProductQuantities
+      : item.combo_product_quantities && typeof item.combo_product_quantities === 'object' && !Array.isArray(item.combo_product_quantities)
+      ? item.combo_product_quantities
+      : {},
     quantityType: item.quantityType ?? item.quantity_type ?? 'Weight',
     pricePerUnit: Number(item.pricePerUnit ?? item.price_per_unit) || 0,
     weights: Array.isArray(item.weights) ? item.weights : [],
@@ -272,6 +293,9 @@ function productRowParams(product) {
     product.image,
     normalizeJsonColumn(product.additionalImages),
     JSON.stringify(Array.isArray(product.comboProductIds) ? product.comboProductIds : []),
+    JSON.stringify(product.comboProductQuantities && typeof product.comboProductQuantities === 'object' && !Array.isArray(product.comboProductQuantities)
+      ? product.comboProductQuantities
+      : {}),
   ];
 }
 
@@ -323,7 +347,8 @@ async function ensureDatabase() {
       reviews_count INTEGER,
       image TEXT,
       additional_images JSONB,
-      combo_product_ids JSONB
+      combo_product_ids JSONB,
+      combo_product_quantities JSONB
     );
   `), 'create products');
   console.log('DB init: products table ready');
@@ -332,6 +357,11 @@ async function ensureDatabase() {
     ALTER TABLE products ADD COLUMN IF NOT EXISTS combo_product_ids JSONB;
   `), 'add combo_product_ids column');
   console.log('DB init: combo_product_ids column ready');
+
+  await withDbTimeout(runQueryLogged(`
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS combo_product_quantities JSONB;
+  `), 'add combo_product_quantities column');
+  console.log('DB init: combo_product_quantities column ready');
 
   console.log('DB init: adding quantity_type column');
   await withDbTimeout(runQueryLogged(`
@@ -1392,6 +1422,20 @@ const validateProductInput = (product, isUpdate = false) => {
   if (product.comboProductIds?.length > 0 && !isComboProduct) {
     return 'Only combo products can include selected products.';
   }
+  if (product.comboProductQuantities !== undefined && (
+    !product.comboProductQuantities ||
+    typeof product.comboProductQuantities !== 'object' ||
+    Array.isArray(product.comboProductQuantities) ||
+    Object.entries(product.comboProductQuantities).some(([id, quantity]) => (
+      !product.comboProductIds?.map(String).includes(id) ||
+      !Number.isInteger(Number(quantity)) ||
+      Number(quantity) < 1 ||
+      Number(quantity) > 1_000_000
+    ))
+  )) return 'Enter a valid quantity for each included combo product.';
+  if (!isComboProduct && Object.keys(product.comboProductQuantities || {}).length > 0) {
+    return 'Only combo products can have included product quantities.';
+  }
   if (!(Number(product.pricePerUnit) > 0) && !(Array.isArray(product.weights) && product.weights.length > 0)) {
     return 'Add at least one product price.';
   }
@@ -2077,7 +2121,9 @@ app.post('/api/orders', orderRateLimiter, optionalAuthenticateToken, async (req,
               image: comboProduct.image || '',
               productType: comboProduct.productType || 'Product',
               category: comboProduct.category || '',
-              quantity: 1,
+              price: Number(comboProduct.pricePerUnit) || Number(comboProduct.weights?.[0]?.price) || 0,
+              quantity: Number(product.comboProductQuantities?.[String(comboProduct.id)]) || 1,
+              unit: getComboProductUnit(comboProduct),
             })),
           } : {}),
         },
