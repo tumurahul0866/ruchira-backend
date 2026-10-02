@@ -1247,6 +1247,39 @@ app.use(
     credentials: true,
   })
 );
+
+app.put(
+  '/api/store-settings/logo',
+  express.raw({ type: ['image/png', 'image/jpeg', 'image/webp'], limit: '500kb' }),
+  requireAdmin,
+  async (req, res) => {
+    try {
+      if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+        return res.status(400).json({ error: 'Choose a PNG, JPEG, or WebP logo image.' });
+      }
+
+      const image = req.body;
+      const contentType = req.headers['content-type']?.split(';')[0].trim().toLowerCase();
+      const isPng = contentType === 'image/png' && image.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+      const isJpeg = contentType === 'image/jpeg' && image[0] === 0xff && image[1] === 0xd8 && image[2] === 0xff;
+      const isWebp = contentType === 'image/webp' &&
+        image.toString('ascii', 0, 4) === 'RIFF' &&
+        image.toString('ascii', 8, 12) === 'WEBP';
+      if (!isPng && !isJpeg && !isWebp) {
+        return res.status(400).json({ error: 'The selected file is not a valid PNG, JPEG, or WebP image.' });
+      }
+
+      const settings = await readStoreSettings();
+      const logoUrl = `data:${contentType};base64,${image.toString('base64')}`;
+      await writeStoreSettings({ ...settings, logoUrl });
+      res.json({ logoUrl });
+    } catch (error) {
+      console.error('Failed to upload store logo:', error);
+      res.status(500).json({ error: 'Unable to save the store logo.' });
+    }
+  }
+);
+
 app.use(express.json());
 
 app.get('/health', (_req, res) => {
