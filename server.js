@@ -352,6 +352,15 @@ async function ensureDatabase() {
   `), 'create reviews');
   console.log('DB init: reviews table ready');
 
+  await withDbTimeout(runQueryLogged(`
+    ALTER TABLE reviews
+      ADD COLUMN IF NOT EXISTS user_id TEXT,
+      ADD COLUMN IF NOT EXISTS user_email TEXT,
+      ADD COLUMN IF NOT EXISTS user_name TEXT,
+      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
+  `), 'add review metadata columns');
+
   console.log('DB init: creating offers table');
   await withDbTimeout(runQueryLogged(`
     CREATE TABLE IF NOT EXISTS offers (
