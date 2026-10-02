@@ -98,6 +98,7 @@ const PRODUCT_COLUMNS = [
   'reviews_count',
   'image',
   'additional_images',
+  'combo_product_ids',
 ];
 
 const productInsertQuery = `
@@ -124,7 +125,8 @@ const productInsertQuery = `
     rating = EXCLUDED.rating,
     reviews_count = EXCLUDED.reviews_count,
     image = EXCLUDED.image,
-    additional_images = EXCLUDED.additional_images;
+    additional_images = EXCLUDED.additional_images,
+    combo_product_ids = EXCLUDED.combo_product_ids;
 `;
 
 function parseJsonValue(value) {
@@ -139,6 +141,7 @@ function parseJsonValue(value) {
 function normalizeProduct(product) {
   const weights = parseJsonValue(product.weights);
   const additionalImages = parseJsonValue(product.additionalImages ?? product.additional_images);
+  const comboProductIds = parseJsonValue(product.comboProductIds ?? product.combo_product_ids);
 
   return {
     id: product.id,
@@ -163,7 +166,22 @@ function normalizeProduct(product) {
     reviewsCount: Number(product.reviewsCount ?? product.reviews_count) || 0,
     image: product.image,
     additionalImages: Array.isArray(additionalImages) ? additionalImages : [],
+    comboProductIds: Array.isArray(comboProductIds) ? comboProductIds : [],
   };
+}
+
+function withComboProductDetails(products, sourceProducts = products) {
+  return products.map((product) => {
+    if (String(product.productType || '').trim().toLowerCase() !== 'combos') return product;
+    const comboProductIds = Array.isArray(product.comboProductIds) ? product.comboProductIds : [];
+    return {
+      ...product,
+      comboProducts: comboProductIds
+        .map((id) => sourceProducts.find((candidate) => String(candidate.id) === String(id)))
+        .filter(Boolean)
+        .map(({ id, name, image }) => ({ id, name, image: image || '', quantity: 1 })),
+    };
+  });
 }
 
 function normalizeProductInput(item) {
@@ -243,6 +261,7 @@ function productRowParams(product) {
     product.reviewsCount,
     product.image,
     normalizeJsonColumn(product.additionalImages),
+    JSON.stringify(Array.isArray(product.comboProductIds) ? product.comboProductIds : []),
   ];
 }
 
@@ -293,10 +312,16 @@ async function ensureDatabase() {
       rating NUMERIC,
       reviews_count INTEGER,
       image TEXT,
-      additional_images JSONB
+      additional_images JSONB,
+      combo_product_ids JSONB
     );
   `), 'create products');
   console.log('DB init: products table ready');
+
+  await withDbTimeout(runQueryLogged(`
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS combo_product_ids JSONB;
+  `), 'add combo_product_ids column');
+  console.log('DB init: combo_product_ids column ready');
 
   console.log('DB init: adding quantity_type column');
   await withDbTimeout(runQueryLogged(`
@@ -1342,8 +1367,33 @@ const validateProductInput = (product, isUpdate = false) => {
     !Array.isArray(product.additionalImages) || product.additionalImages.length > 20 ||
     product.additionalImages.some((image) => !isSafeImageUrl(image))
   )) return 'Enter valid additional product images.';
+  const isComboProduct = String(product.productType || '').trim().toLowerCase() === 'combos';
+  if (product.comboProductIds !== undefined && (
+    !Array.isArray(product.comboProductIds) ||
+    product.comboProductIds.length > 20 ||
+    (product.comboProductIds.length > 0 && product.comboProductIds.length < 2) ||
+    product.comboProductIds.some((id) => !isValidResourceId(String(id))) ||
+    new Set(product.comboProductIds.map(String)).size !== product.comboProductIds.length
+  )) return 'A combo must include 2 to 20 different products.';
+  if (isComboProduct && (!Array.isArray(product.comboProductIds) || product.comboProductIds.length < 2)) {
+    return 'Select at least two products for the combo.';
+  }
+  if (product.comboProductIds?.length > 0 && !isComboProduct) {
+    return 'Only combo products can include selected products.';
+  }
   if (!(Number(product.pricePerUnit) > 0) && !(Array.isArray(product.weights) && product.weights.length > 0)) {
     return 'Add at least one product price.';
+  }
+  return null;
+};
+
+const validateComboProductReferences = (product, products, currentProductId = '') => {
+  if (String(product.productType || '').trim().toLowerCase() !== 'combos') return null;
+  const selectedIds = product.comboProductIds.map(String);
+  if (selectedIds.includes(String(currentProductId))) return 'A combo cannot contain itself.';
+  const selectedProducts = selectedIds.map((id) => products.find((candidate) => String(candidate.id) === id));
+  if (selectedProducts.some((candidate) => !candidate || String(candidate.productType || '').trim().toLowerCase() === 'combos')) {
+    return 'Combos can only include existing non-combo products.';
   }
   return null;
 };
@@ -1765,7 +1815,8 @@ app.get('/api/products', optionalAuthenticateToken, async (req, res) => {
     if (req.user?.isAdmin && !await isCurrentAdmin(req.user)) {
       return res.status(403).json({ error: 'Forbidden' });
     }
-    res.json(req.user?.isAdmin ? products : products.filter((product) => product.visible !== false));
+    const visibleProducts = req.user?.isAdmin ? products : products.filter((product) => product.visible !== false);
+    res.json(withComboProductDetails(visibleProducts, products));
   } catch {
     console.error('Failed to read products.');
     res.status(500).json({ error: 'Unable to read products.' });
@@ -1782,7 +1833,7 @@ app.get('/api/products/:id', optionalAuthenticateToken, async (req, res) => {
     if (!product || (product.visible === false && !isAdmin)) {
       return res.status(404).json({ error: 'Product not found.' });
     }
-    res.json(product);
+    res.json(withComboProductDetails([product], products)[0]);
   } catch {
     console.error('Failed to read product.');
     res.status(500).json({ error: 'Unable to read product.' });
@@ -1796,6 +1847,8 @@ app.post('/api/products', requireAdmin, async (req, res) => {
     if (validationError) return res.status(400).json({ error: validationError });
 
     const products = await readProducts();
+    const comboReferenceError = validateComboProductReferences(product, products);
+    if (comboReferenceError) return res.status(400).json({ error: comboReferenceError });
     const nextProduct = {
       ...normalizeProductInput(product),
       id: product.id || Date.now().toString(),
@@ -1810,7 +1863,8 @@ app.post('/api/products', requireAdmin, async (req, res) => {
       products.push(nextProduct);
       await writeProducts(products);
     }
-    res.json(nextProduct);
+    const savedProducts = [...products.filter((candidate) => String(candidate.id) !== String(nextProduct.id)), nextProduct];
+    res.json(withComboProductDetails([nextProduct], savedProducts)[0]);
   } catch {
     console.error('Failed to create product.');
     res.status(500).json({ error: 'Unable to create product.' });
@@ -1828,6 +1882,8 @@ app.put('/api/products/:id', requireAdmin, async (req, res) => {
     if (index < 0) {
       return res.status(404).json({ error: 'Product not found.' });
     }
+    const comboReferenceError = validateComboProductReferences(productUpdates, products, req.params.id);
+    if (comboReferenceError) return res.status(400).json({ error: comboReferenceError });
 
     const updatedProduct = {
       ...products[index],
@@ -1843,7 +1899,8 @@ app.put('/api/products/:id', requireAdmin, async (req, res) => {
       products[index] = updatedProduct;
       await writeProducts(products);
     }
-    res.json(updatedProduct);
+    const savedProducts = [...products.filter((candidate) => String(candidate.id) !== String(updatedProduct.id)), updatedProduct];
+    res.json(withComboProductDetails([updatedProduct], savedProducts)[0]);
   } catch {
     console.error('Failed to update product.');
     res.status(500).json({ error: 'Unable to update product.' });
@@ -1854,6 +1911,12 @@ app.delete('/api/products/:id', requireAdmin, async (req, res) => {
   try {
     if (!isValidResourceId(req.params.id)) return res.status(400).json({ error: 'Invalid product ID.' });
     const prodId = req.params.id;
+    const products = await readProducts();
+    if (products.some((product) => (
+      Array.isArray(product.comboProductIds) && product.comboProductIds.map(String).includes(prodId)
+    ))) {
+      return res.status(409).json({ error: 'This product is included in a combo. Remove it from the combo before deleting it.' });
+    }
     if (isPostgresEnabled && pool) {
       try {
         const result = await pool.query('DELETE FROM products WHERE id = $1', [prodId]);
@@ -1872,7 +1935,6 @@ app.delete('/api/products/:id', requireAdmin, async (req, res) => {
     }
 
     // Fallback to local JSON store when Postgres is not enabled
-    const products = await readProducts();
     const updatedProducts = products.filter((item) => item.id !== prodId);
     await writeProducts(updatedProducts);
     res.json({ success: true });
@@ -1976,6 +2038,20 @@ app.post('/api/orders', orderRateLimiter, optionalAuthenticateToken, async (req,
         return res.status(400).json({ error: 'A selected product option is no longer available.' });
       }
 
+      let comboProducts;
+      if (String(product.productType || '').trim().toLowerCase() === 'combos') {
+        const comboProductIds = Array.isArray(product.comboProductIds) ? product.comboProductIds.map(String) : [];
+        comboProducts = comboProductIds.map((comboProductId) => (
+          products.find((candidate) => String(candidate.id) === comboProductId)
+        ));
+        if (comboProducts.length < 2 || comboProducts.some((comboProduct) => (
+          !comboProduct || comboProduct.inStock === false ||
+          String(comboProduct.productType || '').trim().toLowerCase() === 'combos'
+        ))) {
+          return res.status(400).json({ error: 'One or more products in this combo are unavailable.' });
+        }
+      }
+
       itemsSubtotal += unitPrice * quantity;
       verifiedItems.push({
         product: {
@@ -1983,6 +2059,14 @@ app.post('/api/orders', orderRateLimiter, optionalAuthenticateToken, async (req,
           name: product.name,
           image: product.image || '',
           quantityType: product.quantityType || 'Unit',
+          ...(comboProducts ? {
+            comboProducts: comboProducts.map((comboProduct) => ({
+              id: comboProduct.id,
+              name: comboProduct.name,
+              image: comboProduct.image || '',
+              quantity: 1,
+            })),
+          } : {}),
         },
         quantity,
         weightOption: {
