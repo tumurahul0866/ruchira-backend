@@ -1,6 +1,8 @@
 import dotenv from 'dotenv';
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
@@ -24,8 +26,11 @@ const requiresStableJwtSecret =
 const JWT_SECRET = process.env.JWT_SECRET || (requiresStableJwtSecret ? '' : crypto.randomBytes(32).toString('hex'));
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
 
-if (requiresStableJwtSecret && !JWT_SECRET) {
-  throw new Error('JWT_SECRET must be configured for production and serverless deployments.');
+if (requiresStableJwtSecret && (!JWT_SECRET || JWT_SECRET.length < 32)) {
+  throw new Error('A JWT_SECRET of at least 32 characters must be configured for production and serverless deployments.');
+}
+if (requiresStableJwtSecret && (!process.env.DEFAULT_ADMIN_PASSWORD || Buffer.byteLength(process.env.DEFAULT_ADMIN_PASSWORD, 'utf8') < 12 || Buffer.byteLength(process.env.DEFAULT_ADMIN_PASSWORD, 'utf8') > 72)) {
+  throw new Error('DEFAULT_ADMIN_PASSWORD must be between 12 and 72 UTF-8 bytes for production deployments.');
 }
 
 const isVercel =
@@ -67,18 +72,7 @@ async function runQueryLogged(sql, params = []) {
   if (!pool) {
     throw new Error('Postgres pool is not initialized');
   }
-  const start = Date.now();
-  try {
-    console.log('QUERY START', { sql: sql.replace(/\s+/g, ' ').trim().slice(0, 200) });
-    const res = await pool.query(sql, params);
-    const duration = Date.now() - start;
-    console.log('QUERY END', { sql: sql.replace(/\s+/g, ' ').trim().slice(0,200), duration_ms: duration, rowCount: res.rowCount });
-    return res;
-  } catch (err) {
-    const duration = Date.now() - start;
-    console.error('QUERY ERROR', { sql: sql.replace(/\s+/g, ' ').trim().slice(0, 200), duration_ms: duration, message: err && err.message });
-    throw err;
-  }
+  return pool.query(sql, params);
 }
 
 const PRODUCT_COLUMNS = [
@@ -188,7 +182,7 @@ function normalizeOrderItem(item) {
   return {
     ...parsedItem,
     product: typeof product === 'string' ? { name: product } : product || {},
-    quantity: Number(parsedItem?.quantity) || 1,
+    quantity: parsedItem?.quantity,
   };
 }
 
@@ -525,24 +519,26 @@ async function ensureStore() {
 
 async function readCredentials() {
   if (isPostgresEnabled && pool) {
-    try {
-      const r = await runQueryLogged('SELECT email, password FROM admin_credentials ORDER BY id LIMIT 1');
-      return r.rows[0] || defaultCredentials;
-    } catch (err) {
-      console.error('readCredentials: DB error', err && err.message);
-      throw err;
-    }
+    const r = await runQueryLogged('SELECT email, password FROM admin_credentials ORDER BY id LIMIT 1');
+    return r.rows[0] || defaultCredentials;
   }
 
   await ensureStore();
   const raw = await fs.readFile(dataFile, 'utf8');
-  return JSON.parse(raw);
+  const credentials = JSON.parse(raw);
+  const storedPassword = String(credentials.password || '');
+  const isHashed = /^\$2[aby]\$/.test(storedPassword);
+  if (storedPassword && !isHashed) {
+    credentials.password = await bcrypt.hash(storedPassword, 10);
+    await fs.writeFile(dataFile, JSON.stringify(credentials, null, 2), 'utf8');
+  }
+  return credentials;
 }
 
 async function writeCredentials(nextState) {
   // Normalize email and ensure password is hashed before storing
   const email = String(nextState.email || defaultCredentials.email).trim().toLowerCase();
-  const password = String(nextState.password || '').trim();
+  const password = String(nextState.password || '');
   const isHashed = password.startsWith('$2a$') || password.startsWith('$2b$') || password.startsWith('$2y$');
   const toStorePassword = isHashed ? password : await bcrypt.hash(password, 10);
 
@@ -560,7 +556,7 @@ async function writeCredentials(nextState) {
 
       return { ...nextState, email, password: toStorePassword };
     } catch (err) {
-      console.error('writeCredentials: DB error', err && err.message);
+      console.error('Admin credential persistence failed.');
       throw err;
     }
   }
@@ -579,7 +575,7 @@ async function normalizeAdminCredentials() {
     credentials = r.rows[0];
     if (!credentials) return;
   } catch (err) {
-    console.error('normalizeAdminCredentials: initial SELECT error', err && err.message);
+    console.error('Admin credential initialization failed.');
     throw err;
   }
 
@@ -606,7 +602,7 @@ async function normalizeAdminCredentials() {
   try {
     await runQueryLogged('UPDATE admin_credentials SET email = $1, password = $2, updated_at = NOW() WHERE id = $3', [emailToStore, hashedPassword, credentials.id]);
   } catch (err) {
-    console.error('normalizeAdminCredentials: DB error', err && err.message);
+    console.error('Admin credential normalization failed.');
     throw err;
   }
 }
@@ -625,9 +621,9 @@ async function readProducts() {
     try {
       const { rows } = await pool.query('SELECT * FROM products ORDER BY name');
       return rows.map(normalizeProduct);
-    } catch (error) {
-      console.error('Failed to read products from PostgreSQL:', error.message);
-      throw error;
+    } catch {
+      console.error('Failed to read products from PostgreSQL.');
+      throw new Error('Product data is unavailable.');
     }
   }
 
@@ -635,17 +631,17 @@ async function readProducts() {
   let raw;
   try {
     raw = await fs.readFile(productsFile, 'utf8');
-  } catch (readErr) {
-    console.warn('readProducts: product file is unavailable; returning an empty catalog:', readErr && readErr.message ? readErr.message : readErr);
-    return [];
+  } catch {
+    console.error('Product file is unavailable.');
+    throw new Error('Product data is unavailable.');
   }
 
   try {
     const products = JSON.parse(raw);
     return Array.isArray(products) ? products.map(normalizeProduct) : [];
-  } catch (error) {
-    console.warn('Invalid products file content; returning an empty catalog:', error.message);
-    return [];
+  } catch {
+    console.error('Product file contains invalid JSON.');
+    throw new Error('Product data is unavailable.');
   }
 }
 
@@ -655,7 +651,7 @@ async function writeProduct(product) {
       await pool.query(productInsertQuery, productRowParams(product));
       return product;
     } catch (error) {
-      console.error('Failed to persist products to PostgreSQL:', error.message);
+      console.error('Failed to persist products to PostgreSQL.');
       throw error;
     }
   }
@@ -783,7 +779,6 @@ async function readOrders() {
     try {
       
       const { rows } = await pool.query('SELECT * FROM orders ORDER BY date DESC');
-      console.log('readOrders: retrieved', rows.length, 'rows from Postgres');
       return rows.map((row) => ({
         id: row.id,
         date: row.date,
@@ -795,8 +790,9 @@ async function readOrders() {
         customer: row.customer || {},
         items: row.items || [],
       }));
-    } catch (error) {
-      console.warn('Falling back to local orders file:', error && error.stack ? error.stack : error.message);
+    } catch {
+      console.error('Failed to read orders from PostgreSQL.');
+      throw new Error('Order data is unavailable.');
     }
   }
   return readJsonFile(ordersFile, defaultOrders);
@@ -818,7 +814,6 @@ function deepParseJsonValue(value) {
 
 async function writeOrders(nextOrders) {
   if (isPostgresEnabled && pool) {
-    console.log('writeOrders: using Postgres path; order count =', Array.isArray(nextOrders) ? nextOrders.length : 0);
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -845,21 +840,21 @@ async function writeOrders(nextOrders) {
               itemsJson,
             ]
           );
-        } catch (rowError) {
-          console.error('writeOrders: failed inserting order row:', rowError && rowError.stack ? rowError.stack : rowError, 'order=', JSON.stringify(order));
-          throw rowError;
+        } catch {
+          console.error('Failed to persist an order row.');
+          throw new Error('Order persistence failed.');
         }
       }
       await client.query('COMMIT');
       return nextOrders;
-    } catch (error) {
+    } catch {
       try {
         await client.query('ROLLBACK');
-      } catch (rbErr) {
-        console.error('writeOrders: rollback failed:', rbErr && rbErr.stack ? rbErr.stack : rbErr);
+      } catch {
+        console.error('Order persistence rollback failed.');
       }
-      console.error('writeOrders: Database order write failed:', error && error.stack ? error.stack : error);
-      throw error;
+      console.error('Order persistence failed.');
+      throw new Error('Order persistence failed.');
     } finally {
       client.release();
     }
@@ -1177,31 +1172,34 @@ async function writeProductTypes(types) {
 }
 
 async function readUserProfile(email) {
+  let profile;
   if (isPostgresEnabled && pool) {
-    
     const { rows } = await pool.query('SELECT profile FROM user_profiles WHERE email = $1', [email]);
-    return rows[0]?.profile || { name: '', email, phone: '', addresses: [], wishlist: [] };
+    profile = rows[0]?.profile;
+  } else {
+    const data = await readJsonFile(userProfilesFile, {});
+    profile = data[email];
   }
-  const data = await readJsonFile(userProfilesFile, {});
-  return data[email] || { name: '', email, phone: '', addresses: [], wishlist: [] };
+  return toPublicUserProfile(profile || {}, email);
 }
 
 async function writeUserProfile(email, profile) {
+  const currentProfile = await readUserProfile(email);
+  const safeProfile = toPublicUserProfile({ ...currentProfile, ...profile }, email);
   if (isPostgresEnabled && pool) {
-    
     const { rowCount } = await pool.query(
       'UPDATE user_profiles SET profile=$1 WHERE email=$2',
-      [profile, email]
+      [safeProfile, email]
     );
     if (rowCount === 0) {
-      await pool.query('INSERT INTO user_profiles (email, profile) VALUES ($1, $2)', [email, profile]);
+      await pool.query('INSERT INTO user_profiles (email, profile) VALUES ($1, $2)', [email, safeProfile]);
     }
-    return profile;
+    return safeProfile;
   }
   const data = await readJsonFile(userProfilesFile, {});
-  data[email] = { ...data[email], ...profile };
+  data[email] = { ...data[email], ...safeProfile };
   await writeJsonFile(userProfilesFile, data);
-  return data[email];
+  return toPublicUserProfile(data[email], email);
 }
 
 async function readCustomers() {
@@ -1228,29 +1226,174 @@ async function readCustomers() {
 
 const app = express();
 
-const allowedOrigins = [
-  'https://ruchira-pickels.vercel.app',
-  'http://localhost:5173',
-  'http://localhost:3000',
-  'http://127.0.0.1:5173',
-  'http://127.0.0.1:3000',
-];
+app.set('trust proxy', 1);
 
-if (process.env.FRONTEND_URL) {
-  allowedOrigins.push(process.env.FRONTEND_URL.trim().replace(/\/$/, ''));
-}
+const allowedOrigins = new Set([
+  'https://ruchira-pickels.vercel.app',
+  ...(process.env.NODE_ENV === 'production'
+    ? []
+    : ['http://localhost:5173', 'http://localhost:3000', 'http://127.0.0.1:5173', 'http://127.0.0.1:3000']),
+  ...(process.env.FRONTEND_URLS || process.env.FRONTEND_URL || '')
+    .split(',')
+    .map((origin) => origin.trim().replace(/\/$/, ''))
+    .filter(Boolean),
+]);
+
+const createRateLimiter = (windowMs, limit, message) => rateLimit({
+  windowMs,
+  limit,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { error: message },
+});
+const loginRateLimiter = createRateLimiter(15 * 60 * 1000, 10, 'Too many login attempts. Please try again later.');
+const otpRequestRateLimiter = createRateLimiter(60 * 60 * 1000, 3, 'Too many verification-code requests. Please try again later.');
+const otpVerifyRateLimiter = createRateLimiter(15 * 60 * 1000, 10, 'Too many verification attempts. Please request a new code later.');
+const passwordResetRateLimiter = createRateLimiter(15 * 60 * 1000, 5, 'Too many password reset attempts. Please try again later.');
+const orderRateLimiter = createRateLimiter(15 * 60 * 1000, 10, 'Too many order requests. Please try again later.');
+const pinLookupRateLimiter = createRateLimiter(15 * 60 * 1000, 30, 'Too many PIN lookups. Please try again later.');
+
+const isValidEmail = (value) => (
+  typeof value === 'string' &&
+  value.length <= 254 &&
+  /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim())
+);
+const isValidPassword = (value, minimumLength = 8) => (
+  typeof value === 'string' &&
+  value.length >= minimumLength &&
+  Buffer.byteLength(value, 'utf8') <= 72
+);
+const containsControlCharacters = (value) => (
+  typeof value === 'string' &&
+  [...value].some((character) => {
+    const code = character.charCodeAt(0);
+    return code <= 0x1f || code === 0x7f;
+  })
+);
+const isValidName = (value, maximumLength = 100) => (
+  typeof value === 'string' &&
+  value.trim().length > 0 &&
+  value.trim().length <= maximumLength &&
+  !containsControlCharacters(value)
+);
+const isValidPhone = (value) => (
+  typeof value === 'string' &&
+  value.length <= 32 &&
+  /^[+()\d\s.-]+$/.test(value) &&
+  value.replace(/\D/g, '').length >= 7 &&
+  value.replace(/\D/g, '').length <= 15
+);
+const isValidResourceId = (value) => (
+  typeof value === 'string' &&
+  value.length > 0 &&
+  value.length <= 128 &&
+  /^[A-Za-z0-9_-]+$/.test(value)
+);
+const isNonNegativeAmount = (value) => Number.isFinite(Number(value)) && Number(value) >= 0;
+const isSafeImageUrl = (value) => (
+  typeof value === 'string' &&
+  value.length <= 2_000_000 &&
+  (!value || (value.startsWith('/') && !value.startsWith('//')) ||
+    /^https:\/\/[^\s]+$/i.test(value) ||
+    /^data:image\/(?:png|jpeg|webp);base64,[a-z0-9+/=]+$/i.test(value))
+);
+const isBoundedJsonData = (value, depth = 0) => {
+  if (depth > 8) return false;
+  if (value === null || typeof value === 'boolean') return true;
+  if (typeof value === 'string') return value.length <= 750_000;
+  if (typeof value === 'number') return Number.isFinite(value);
+  if (Array.isArray(value)) return value.length <= 100 && value.every((item) => isBoundedJsonData(item, depth + 1));
+  return typeof value === 'object' && Object.keys(value).length <= 100 &&
+    Object.values(value).every((item) => isBoundedJsonData(item, depth + 1));
+};
+const isValidSettingsObject = (value) => (
+  !!value && typeof value === 'object' && !Array.isArray(value) && isBoundedJsonData(value)
+);
+const validateProductInput = (product, isUpdate = false) => {
+  if (!product || typeof product !== 'object' || Array.isArray(product)) return 'Invalid product data.';
+  if (!isValidName(product.name, 150)) return 'Enter a valid product name.';
+  if (typeof product.category !== 'string' || !product.category.trim() || product.category.length > 100) return 'Enter a valid product category.';
+  if (typeof product.productType !== 'string' || !product.productType.trim() || product.productType.length > 100) return 'Enter a valid product type.';
+  if (product.id !== undefined && product.id !== '' && !isValidResourceId(String(product.id))) return 'Invalid product ID.';
+  if (isUpdate && product.id !== undefined && String(product.id) !== '') return 'Product ID cannot be changed.';
+  if (product.quantityType !== undefined && (typeof product.quantityType !== 'string' || product.quantityType.length > 40)) return 'Enter a valid quantity type.';
+  if (product.pricePerUnit !== undefined && !isNonNegativeAmount(product.pricePerUnit)) return 'Enter a valid product price.';
+  if (product.discountPrice !== undefined && !isNonNegativeAmount(product.discountPrice)) return 'Enter a valid discount price.';
+  if (product.bulkPrice !== undefined && !isNonNegativeAmount(product.bulkPrice)) return 'Enter a valid bulk price.';
+  if (product.stockQuantity !== undefined && (!Number.isInteger(Number(product.stockQuantity)) || Number(product.stockQuantity) < 0 || Number(product.stockQuantity) > 1_000_000)) return 'Enter a valid stock quantity.';
+  for (const key of ['description', 'ingredients', 'shelfLife', 'spiceLevel']) {
+    if (product[key] !== undefined && (typeof product[key] !== 'string' || product[key].length > (key === 'description' || key === 'ingredients' ? 10_000 : 200))) return `Enter valid ${key.toLowerCase()} information.`;
+  }
+  for (const key of ['inStock', 'bestSeller', 'newArrival', 'visible']) {
+    if (product[key] !== undefined && typeof product[key] !== 'boolean') return `Invalid ${key} value.`;
+  }
+  if (product.weights !== undefined && (
+    !Array.isArray(product.weights) || product.weights.length > 50 ||
+    product.weights.some((weight) => (
+      !weight || typeof weight !== 'object' || Array.isArray(weight) ||
+      typeof (weight.weight ?? weight.label) !== 'string' ||
+      !(weight.weight ?? weight.label).trim() || (weight.weight ?? weight.label).length > 64 ||
+      !Number.isFinite(Number(weight.price)) || Number(weight.price) <= 0
+    ))
+  )) return 'Enter valid product options and prices.';
+  if (product.variants !== undefined && !Array.isArray(product.variants)) return 'Product options must be an array.';
+  if (product.image !== undefined && !isSafeImageUrl(product.image)) return 'Enter a valid product image URL.';
+  if (product.additionalImages !== undefined && (
+    !Array.isArray(product.additionalImages) || product.additionalImages.length > 20 ||
+    product.additionalImages.some((image) => !isSafeImageUrl(image))
+  )) return 'Enter valid additional product images.';
+  if (!(Number(product.pricePerUnit) > 0) && !(Array.isArray(product.weights) && product.weights.length > 0)) {
+    return 'Add at least one product price.';
+  }
+  return null;
+};
+const toPublicUserProfile = (profile, email) => ({
+  name: typeof profile?.name === 'string' ? profile.name.slice(0, 100) : '',
+  email,
+  phone: typeof profile?.phone === 'string' ? profile.phone.slice(0, 32) : '',
+  addresses: Array.isArray(profile?.addresses)
+    ? profile.addresses.slice(0, 20).map((address) => ({
+      id: String(address?.id || '').slice(0, 128),
+      label: typeof address?.label === 'string' ? address.label.slice(0, 40) : '',
+      name: typeof address?.name === 'string' ? address.name.slice(0, 100) : '',
+      phone: typeof address?.phone === 'string' ? address.phone.slice(0, 32) : '',
+      street: typeof address?.street === 'string' ? address.street.slice(0, 500) : '',
+      city: typeof address?.city === 'string' ? address.city.slice(0, 100) : '',
+      state: typeof address?.state === 'string' ? address.state.slice(0, 100) : '',
+      pincode: typeof address?.pincode === 'string' ? address.pincode.slice(0, 6) : '',
+      landmark: typeof address?.landmark === 'string' ? address.landmark.slice(0, 200) : '',
+    }))
+    : [],
+  wishlist: Array.isArray(profile?.wishlist)
+    ? profile.wishlist.filter((id) => isValidResourceId(String(id))).slice(0, 500).map(String)
+    : [],
+});
+const toPublicReview = (review) => ({
+  id: String(review?.id || ''),
+  name: typeof review?.name === 'string' ? review.name.slice(0, 100) : '',
+  product: typeof review?.product === 'string' ? review.product.slice(0, 100) : '',
+  rating: Number(review?.rating) || 0,
+  date: typeof review?.date === 'string' ? review.date.slice(0, 100) : '',
+  text: typeof review?.text === 'string' ? review.text.slice(0, 2000) : '',
+  visible: review?.visible !== false,
+  verifiedBuyer: review?.verifiedBuyer === true,
+});
 
 app.use(
   cors({
     origin: (origin, callback) => {
-      if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.vercel.app')) {
+      if (!origin || allowedOrigins.has(origin)) {
         return callback(null, true);
       }
-      return callback(new Error('Origin is not allowed by CORS'));
+      const error = new Error('Origin is not allowed by CORS');
+      error.status = 403;
+      return callback(error);
     },
     credentials: true,
   })
 );
+
+app.use(helmet());
 
 app.put(
   '/api/store-settings/logo',
@@ -1277,14 +1420,14 @@ app.put(
       const logoUrl = `data:${contentType};base64,${image.toString('base64')}`;
       await writeStoreSettings({ ...settings, logoUrl });
       res.json({ logoUrl });
-    } catch (error) {
-      console.error('Failed to upload store logo:', error);
+    } catch {
+      console.error('Failed to upload store logo.');
       res.status(500).json({ error: 'Unable to save the store logo.' });
     }
   }
 );
 
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '1mb', strict: true }));
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
@@ -1296,22 +1439,23 @@ app.get('/api/admin-credentials', requireAdmin, async (_req, res) => {
   try {
     const credentials = await readCredentials();
     res.json({ email: credentials.email });
-  } catch (error) {
-    console.error('Failed to read admin credentials:', error);
+  } catch {
+    console.error('Failed to read admin credentials.');
     res.status(500).json({ error: 'Unable to read admin credentials.' });
   }
 });
 
 // Admin login endpoint
-app.post('/api/admin/login', async (req, res) => {
+app.post('/api/admin/login', loginRateLimiter, async (req, res) => {
   try {
     const { email, password } = req.body || {};
-    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+    if (!isValidEmail(email) || !isValidPassword(password, 1)) {
+      return res.status(400).json({ error: 'A valid email and password are required.' });
+    }
     const creds = await readCredentials();
     const inputEmail = String(email).trim().toLowerCase();
     const storedEmail = String(creds.email || '').trim().toLowerCase();
     const storedPass = String(creds.password || '');
-    const defaultLogin = inputEmail === defaultCredentials.email.toLowerCase() && password === defaultCredentials.password;
 
     let ok = false;
     if (storedEmail === inputEmail) {
@@ -1325,18 +1469,13 @@ app.post('/api/admin/login', async (req, res) => {
       }
     }
 
-    if (!ok && defaultLogin) {
-      // Restore the default admin credentials when the default admin login is used.
-      await writeCredentials({ email: defaultCredentials.email, password: defaultCredentials.password });
-      ok = true;
-    }
-
     if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
-    const token = generateToken({ id: 'admin', email: defaultLogin ? defaultCredentials.email : creds.email, name: 'Administrator', isAdmin: true, role: 'admin' });
-    const out = { token, email: defaultLogin ? defaultCredentials.email : creds.email, name: 'Administrator' };
+    const authVersion = crypto.createHmac('sha256', JWT_SECRET).update(String(creds.password || '')).digest('hex');
+    const token = generateToken({ id: 'admin', email: creds.email, name: 'Administrator', isAdmin: true, role: 'admin', authVersion });
+    const out = { token, email: creds.email, name: 'Administrator' };
     res.json(out);
-  } catch (error) {
-    console.error('admin login error', error);
+  } catch {
+    console.error('Admin login failed.');
     return res.status(500).json({ error: 'Unable to authenticate' });
   }
 });
@@ -1346,29 +1485,26 @@ const adminResetResponse = {
   message: 'If an account exists for this email, a verification code has been sent.',
 };
 
-app.post('/api/admin/forgot-password', async (req, res) => {
+app.post('/api/admin/forgot-password', otpRequestRateLimiter, async (req, res) => {
   try {
     const cleanEmail = String(req.body?.email || '').trim().toLowerCase();
-    if (!cleanEmail) return res.status(400).json({ error: 'Email address is required' });
+    if (!isValidEmail(cleanEmail)) return res.status(400).json({ error: 'A valid email address is required.' });
 
     const credentials = await readCredentials();
     const adminEmail = String(credentials.email || '').trim().toLowerCase();
     if (cleanEmail !== adminEmail) {
-      console.info('Admin password reset skipped', { result: 'admin_not_found' });
       return res.json(adminResetResponse);
     }
 
-    if (!isPostgresEnabled || !pool) {
-      console.warn('Admin password reset unavailable', { reason: 'storage_unavailable' });
-      return res.status(503).json({ error: 'Admin password reset is unavailable.' });
-    }
-
-    const recent = await pool.query(
-      "SELECT created_at FROM password_reset_otps WHERE user_id = 'admin' AND LOWER(email) = $1 AND created_at > NOW() - INTERVAL '60 seconds' LIMIT 1",
-      [cleanEmail]
-    );
-    if (recent.rows.length > 0) {
-      return res.status(429).json({ error: 'Please wait 60 seconds before requesting another code.' });
+    if (isPostgresEnabled && pool) {
+      const recent = await pool.query(
+        "SELECT created_at FROM password_reset_otps WHERE user_id = 'admin' AND LOWER(email) = $1 AND created_at > NOW() - INTERVAL '60 seconds' LIMIT 1",
+        [cleanEmail]
+      );
+      if (recent.rows.length > 0) return res.json(adminResetResponse);
+    } else if (credentials.pending_otp_created &&
+        Date.now() - new Date(credentials.pending_otp_created).getTime() < 60 * 1000) {
+      return res.json(adminResetResponse);
     }
 
     const otpCode = crypto.randomInt(100000, 1000000).toString();
@@ -1376,11 +1512,22 @@ app.post('/api/admin/forgot-password', async (req, res) => {
     const otpId = `admin_otp_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
-    await pool.query("DELETE FROM password_reset_otps WHERE user_id = 'admin' AND LOWER(email) = $1", [cleanEmail]);
-    await pool.query(
-      'INSERT INTO password_reset_otps (id, user_id, email, otp_hash, expires_at) VALUES ($1, $2, $3, $4, $5)',
-      [otpId, 'admin', cleanEmail, otpHash, expiresAt]
-    );
+    if (isPostgresEnabled && pool) {
+      await pool.query("DELETE FROM password_reset_otps WHERE user_id = 'admin' AND LOWER(email) = $1", [cleanEmail]);
+      await pool.query(
+        'INSERT INTO password_reset_otps (id, user_id, email, otp_hash, expires_at) VALUES ($1, $2, $3, $4, $5)',
+        [otpId, 'admin', cleanEmail, otpHash, expiresAt]
+      );
+    } else {
+      await writeCredentials({
+        ...credentials,
+        pending_otp_id: otpId,
+        pending_otp_hash: otpHash,
+        pending_otp_expires: expiresAt.toISOString(),
+        pending_otp_created: new Date().toISOString(),
+        pending_otp_attempts: 0,
+      });
+    }
 
     const emailResult = await sendPasswordResetOTP(cleanEmail, otpCode);
     console.info('Admin password reset dispatch result', {
@@ -1388,83 +1535,182 @@ app.post('/api/admin/forgot-password', async (req, res) => {
       status: emailResult.status || null,
     });
     return res.json(adminResetResponse);
-  } catch (error) {
-    console.error('admin forgot-password error:', error.message);
+  } catch {
+    console.error('Admin password reset request failed.');
     return res.status(500).json({ error: 'Unable to process password reset request.' });
   }
 });
 
-app.post('/api/admin/verify-reset-otp', async (req, res) => {
+app.post('/api/admin/verify-reset-otp', otpVerifyRateLimiter, async (req, res) => {
   try {
     const cleanEmail = String(req.body?.email || '').trim().toLowerCase();
     const cleanOtp = String(req.body?.otp || '').trim();
-    if (!cleanEmail || !/^\d{6}$/.test(cleanOtp)) {
+    if (!isValidEmail(cleanEmail) || !/^\d{6}$/.test(cleanOtp)) {
       return res.status(400).json({ error: 'Email and 6-digit verification code are required' });
     }
 
     if (!isPostgresEnabled || !pool) {
-      return res.status(503).json({ error: 'Admin password reset is unavailable.' });
+      const credentials = await readCredentials();
+      const attempts = Number(credentials.pending_otp_attempts) || 0;
+      if (cleanEmail !== String(credentials.email || '').trim().toLowerCase() ||
+          !credentials.pending_otp_hash || !credentials.pending_otp_expires ||
+          new Date(credentials.pending_otp_expires) <= new Date() || attempts >= 5) {
+        return res.status(400).json({ error: 'Invalid or expired verification code.' });
+      }
+      const nextAttempts = attempts + 1;
+      if (!(await bcrypt.compare(cleanOtp, credentials.pending_otp_hash))) {
+        await writeCredentials({ ...credentials, pending_otp_attempts: nextAttempts });
+        const remaining = Math.max(5 - nextAttempts, 0);
+        return res.status(400).json({
+          error: remaining > 0
+            ? `Incorrect verification code. ${remaining} attempts remaining.`
+            : 'Maximum verification attempts exceeded. Please request a new code.',
+        });
+      }
+      const rawResetToken = crypto.randomBytes(32).toString('hex');
+      const resetTokenHash = await bcrypt.hash(rawResetToken, 10);
+      const resetTokenId = credentials.pending_otp_id;
+      const updatedCredentials = {
+        ...credentials,
+        reset_token_id: resetTokenId,
+        reset_token_hash: resetTokenHash,
+        reset_token_expires: credentials.pending_otp_expires,
+      };
+      for (const key of ['pending_otp_id', 'pending_otp_hash', 'pending_otp_expires', 'pending_otp_created', 'pending_otp_attempts']) {
+        delete updatedCredentials[key];
+      }
+      await writeCredentials(updatedCredentials);
+      return res.json({ success: true, resetToken: `${resetTokenId}:${rawResetToken}` });
     }
 
     const { rows } = await pool.query(
-      "SELECT id, otp_hash, attempts, max_attempts FROM password_reset_otps WHERE user_id = 'admin' AND LOWER(email) = $1 AND verified = FALSE AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1",
+      `UPDATE password_reset_otps
+       SET attempts = attempts + 1
+       WHERE id = (
+         SELECT id FROM password_reset_otps
+         WHERE user_id = 'admin' AND LOWER(email) = $1 AND verified = FALSE
+           AND expires_at > NOW() AND attempts < max_attempts
+         ORDER BY created_at DESC LIMIT 1 FOR UPDATE
+       )
+       RETURNING id, otp_hash, attempts, max_attempts`,
       [cleanEmail]
     );
     const record = rows[0];
     if (!record) return res.status(400).json({ error: 'Invalid or expired verification code.' });
-    if (record.attempts >= record.max_attempts) {
-      return res.status(429).json({ error: 'Maximum verification attempts exceeded. Please request a new code.' });
-    }
-
-    await pool.query('UPDATE password_reset_otps SET attempts = attempts + 1 WHERE id = $1', [record.id]);
     if (!(await bcrypt.compare(cleanOtp, record.otp_hash))) {
-      return res.status(400).json({ error: 'Invalid verification code.' });
+      const remaining = Math.max(record.max_attempts - record.attempts, 0);
+      return res.status(400).json({
+        error: remaining > 0
+          ? `Incorrect verification code. ${remaining} attempts remaining.`
+          : 'Maximum verification attempts exceeded. Please request a new code.',
+      });
     }
 
-    await pool.query('UPDATE password_reset_otps SET verified = TRUE WHERE id = $1', [record.id]);
-    return res.json({ success: true });
-  } catch (error) {
-    console.error('admin verify-reset-otp error:', error.message);
+    const rawResetToken = crypto.randomBytes(32).toString('hex');
+    const resetTokenHash = await bcrypt.hash(rawResetToken, 10);
+    const used = await pool.query(
+      'UPDATE password_reset_otps SET verified = TRUE, reset_token_hash = $1 WHERE id = $2 AND verified = FALSE RETURNING id',
+      [resetTokenHash, record.id]
+    );
+    if (used.rowCount !== 1) return res.status(400).json({ error: 'Invalid or expired verification code.' });
+    return res.json({ success: true, resetToken: `${record.id}:${rawResetToken}` });
+  } catch {
+    console.error('Admin verification-code check failed.');
     return res.status(500).json({ error: 'Unable to verify verification code.' });
   }
 });
 
-app.post('/api/admin/reset-password', async (req, res) => {
+app.post('/api/admin/reset-password', passwordResetRateLimiter, async (req, res) => {
   try {
     const cleanEmail = String(req.body?.email || '').trim().toLowerCase();
     const newPassword = String(req.body?.newPassword || '');
-    if (!cleanEmail || newPassword.length < 8) {
-      return res.status(400).json({ error: 'A new password of at least 8 characters is required.' });
+    const resetToken = String(req.body?.resetToken || '');
+    if (!isValidEmail(cleanEmail) || !isValidPassword(newPassword) || !resetToken) {
+      return res.status(400).json({ error: 'A valid email, reset token, and password of at least 8 characters are required.' });
     }
-    if (!isPostgresEnabled || !pool) {
-      return res.status(503).json({ error: 'Admin password reset is unavailable.' });
-    }
-
-    const credentials = await readCredentials();
-    if (String(credentials.email || '').trim().toLowerCase() !== cleanEmail) {
+    const parts = resetToken.split(':');
+    if (parts.length !== 2 || !isValidResourceId(parts[0]) || !/^[a-f0-9]{64}$/i.test(parts[1])) {
       return res.status(400).json({ error: 'Invalid reset session.' });
     }
 
-    const { rows } = await pool.query(
-      "SELECT id FROM password_reset_otps WHERE user_id = 'admin' AND LOWER(email) = $1 AND verified = TRUE AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1",
-      [cleanEmail]
-    );
-    if (!rows[0]) return res.status(400).json({ error: 'Reset session expired or invalid.' });
+    if (!isPostgresEnabled || !pool) {
+      const credentials = await readCredentials();
+      if (cleanEmail !== String(credentials.email || '').trim().toLowerCase() ||
+          parts[0] !== credentials.reset_token_id ||
+          !credentials.reset_token_hash || !credentials.reset_token_expires ||
+          new Date(credentials.reset_token_expires) <= new Date() ||
+          !(await bcrypt.compare(parts[1], credentials.reset_token_hash))) {
+        return res.status(400).json({ error: 'Reset session expired or invalid.' });
+      }
+      const updatedCredentials = { ...credentials, password: newPassword };
+      for (const key of ['reset_token_id', 'reset_token_hash', 'reset_token_expires']) delete updatedCredentials[key];
+      await writeCredentials(updatedCredentials);
+      return res.json({ success: true, message: 'Password updated successfully. Please log in.' });
+    }
 
-    const passwordHash = await bcrypt.hash(newPassword, 10);
-    await pool.query('UPDATE admin_credentials SET password = $1, updated_at = NOW() WHERE id = (SELECT id FROM admin_credentials WHERE LOWER(email) = $2 LIMIT 1)', [passwordHash, cleanEmail]);
-    await pool.query("DELETE FROM password_reset_otps WHERE user_id = 'admin' AND LOWER(email) = $1", [cleanEmail]);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query(
+        "SELECT id, reset_token_hash FROM password_reset_otps WHERE id = $1 AND user_id = 'admin' AND LOWER(email) = $2 AND verified = TRUE AND expires_at > NOW() FOR UPDATE",
+        [parts[0], cleanEmail]
+      );
+      const record = rows[0];
+      if (!record?.reset_token_hash || !(await bcrypt.compare(parts[1], record.reset_token_hash))) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Reset session expired or invalid.' });
+      }
+
+      const passwordHash = await bcrypt.hash(newPassword, 12);
+      const updated = await client.query(
+        'UPDATE admin_credentials SET password = $1, updated_at = NOW() WHERE LOWER(email) = $2',
+        [passwordHash, cleanEmail]
+      );
+      if (updated.rowCount !== 1) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Reset session expired or invalid.' });
+      }
+      await client.query('DELETE FROM password_reset_otps WHERE id = $1', [record.id]);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
     return res.json({ success: true, message: 'Password updated successfully. Please log in.' });
-  } catch (error) {
-    console.error('admin reset-password error:', error.message);
+  } catch {
+    console.error('Admin password reset failed.');
     return res.status(500).json({ error: 'Unable to reset password.' });
   }
 });
 
 // Protect admin updates — require admin JWT
 function requireAdmin(req, res, next) {
+  authenticateToken(req, res, async () => {
+    try {
+      if (!await isCurrentAdmin(req.user)) return res.status(403).json({ error: 'Forbidden' });
+      return next();
+    } catch {
+      return res.status(503).json({ error: 'Admin authorization is temporarily unavailable.' });
+    }
+  });
+}
+
+async function isCurrentAdmin(user) {
+  if (!user?.isAdmin || user.role !== 'admin') return false;
+  const credentials = await readCredentials();
+  const credentialVersion = crypto.createHmac('sha256', JWT_SECRET).update(String(credentials.password || '')).digest('hex');
+  const tokenVersion = String(user.authVersion || '');
+  const sameVersion = /^[a-f0-9]{64}$/i.test(tokenVersion) &&
+    crypto.timingSafeEqual(Buffer.from(tokenVersion, 'hex'), Buffer.from(credentialVersion, 'hex'));
+  return sameVersion &&
+    String(credentials.email || '').trim().toLowerCase() === String(user.email || '').trim().toLowerCase();
+}
+
+function authenticateOwnerOrAdmin(req, res, next) {
   authenticateToken(req, res, () => {
-    if (!req.user || !req.user.isAdmin) return res.status(403).json({ error: 'Forbidden' });
+    if (req.user?.isAdmin) return requireAdmin(req, res, next);
     return next();
   });
 }
@@ -1474,8 +1720,8 @@ app.post('/api/admin-credentials/password', requireAdmin, async (req, res) => {
     const { currentPassword, newPassword } = req.body || {};
     const credentials = await readCredentials();
 
-    if (!currentPassword || !newPassword || newPassword.length < 6) {
-      return res.status(400).json({ error: 'A valid current password and a new password of at least 6 characters are required.' });
+    if (!isValidPassword(currentPassword, 1) || !isValidPassword(newPassword)) {
+      return res.status(400).json({ error: 'A valid current password and a new password of at least 8 characters are required.' });
     }
 
     const ok = await passwordsMatch(credentials.password, currentPassword);
@@ -1483,10 +1729,10 @@ app.post('/api/admin-credentials/password', requireAdmin, async (req, res) => {
       return res.status(401).json({ error: 'Current password is incorrect.' });
     }
 
-    const updated = await writeCredentials({ ...credentials, password: newPassword });
-    res.json(updated);
-  } catch (error) {
-    console.error('Failed to update admin password:', error);
+    await writeCredentials({ ...credentials, password: newPassword });
+    res.json({ success: true });
+  } catch {
+    console.error('Failed to update admin password.');
     res.status(500).json({ error: 'Unable to update admin password.' });
   }
 });
@@ -1496,7 +1742,7 @@ app.post('/api/admin-credentials/email', requireAdmin, async (req, res) => {
     const { currentPassword, newEmail } = req.body || {};
     const credentials = await readCredentials();
 
-    if (!currentPassword || !newEmail || !newEmail.includes('@')) {
+    if (!isValidPassword(currentPassword, 1) || !isValidEmail(newEmail)) {
       return res.status(400).json({ error: 'A valid current password and a new email address are required.' });
     }
 
@@ -1505,34 +1751,40 @@ app.post('/api/admin-credentials/email', requireAdmin, async (req, res) => {
       return res.status(401).json({ error: 'Current password is incorrect.' });
     }
 
-    const updated = await writeCredentials({ ...credentials, email: newEmail });
-    res.json(updated);
-  } catch (error) {
-    console.error('Failed to update admin email:', error);
+    const updated = await writeCredentials({ ...credentials, email: newEmail.trim().toLowerCase() });
+    res.json({ success: true, email: updated.email });
+  } catch {
+    console.error('Failed to update admin email.');
     res.status(500).json({ error: 'Unable to update admin email.' });
   }
 });
 
-app.get('/api/products', async (_req, res) => {
+app.get('/api/products', optionalAuthenticateToken, async (req, res) => {
   try {
     const products = await readProducts();
-    res.json(products);
-  } catch (error) {
-    console.error('Failed to read products:', error && error.stack ? error.stack : error);
+    if (req.user?.isAdmin && !await isCurrentAdmin(req.user)) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    res.json(req.user?.isAdmin ? products : products.filter((product) => product.visible !== false));
+  } catch {
+    console.error('Failed to read products.');
     res.status(500).json({ error: 'Unable to read products.' });
   }
 });
 
-app.get('/api/products/:id', async (req, res) => {
+app.get('/api/products/:id', optionalAuthenticateToken, async (req, res) => {
   try {
+    if (!isValidResourceId(req.params.id)) return res.status(400).json({ error: 'Invalid product ID.' });
+    const isAdmin = req.user?.isAdmin && await isCurrentAdmin(req.user);
+    if (req.user?.isAdmin && !isAdmin) return res.status(403).json({ error: 'Forbidden' });
     const products = await readProducts();
-    const product = products.find((item) => item.id === req.params.id);
-    if (!product) {
+    const product = products.find((item) => String(item.id) === req.params.id);
+    if (!product || (product.visible === false && !isAdmin)) {
       return res.status(404).json({ error: 'Product not found.' });
     }
     res.json(product);
-  } catch (error) {
-    console.error('Failed to read product:', error);
+  } catch {
+    console.error('Failed to read product.');
     res.status(500).json({ error: 'Unable to read product.' });
   }
 });
@@ -1540,9 +1792,8 @@ app.get('/api/products/:id', async (req, res) => {
 app.post('/api/products', requireAdmin, async (req, res) => {
   try {
     const product = req.body || {};
-    if (!product.name) {
-      return res.status(400).json({ error: 'Product name is required.' });
-    }
+    const validationError = validateProductInput(product);
+    if (validationError) return res.status(400).json({ error: validationError });
 
     const products = await readProducts();
     const nextProduct = {
@@ -1560,17 +1811,20 @@ app.post('/api/products', requireAdmin, async (req, res) => {
       await writeProducts(products);
     }
     res.json(nextProduct);
-  } catch (error) {
-    console.error('Failed to create product:', error);
+  } catch {
+    console.error('Failed to create product.');
     res.status(500).json({ error: 'Unable to create product.' });
   }
 });
 
 app.put('/api/products/:id', requireAdmin, async (req, res) => {
   try {
+    if (!isValidResourceId(req.params.id)) return res.status(400).json({ error: 'Invalid product ID.' });
+    const validationError = validateProductInput(req.body || {}, true);
+    if (validationError) return res.status(400).json({ error: validationError });
     const productUpdates = normalizeProductInput(req.body || {});
     const products = await readProducts();
-    const index = products.findIndex((item) => item.id === req.params.id);
+    const index = products.findIndex((item) => String(item.id) === req.params.id);
     if (index < 0) {
       return res.status(404).json({ error: 'Product not found.' });
     }
@@ -1590,14 +1844,15 @@ app.put('/api/products/:id', requireAdmin, async (req, res) => {
       await writeProducts(products);
     }
     res.json(updatedProduct);
-  } catch (error) {
-    console.error('Failed to update product:', error);
+  } catch {
+    console.error('Failed to update product.');
     res.status(500).json({ error: 'Unable to update product.' });
   }
 });
 
 app.delete('/api/products/:id', requireAdmin, async (req, res) => {
   try {
+    if (!isValidResourceId(req.params.id)) return res.status(400).json({ error: 'Invalid product ID.' });
     const prodId = req.params.id;
     if (isPostgresEnabled && pool) {
       try {
@@ -1610,8 +1865,8 @@ app.delete('/api/products/:id', requireAdmin, async (req, res) => {
           return res.status(404).json({ error: 'Product not found.' });
         }
         return res.json({ success: true, deleted: result.rowCount });
-      } catch (dbErr) {
-        console.error('Failed to delete product from Postgres:', dbErr && dbErr.stack ? dbErr.stack : dbErr);
+      } catch {
+        console.error('Failed to delete product from PostgreSQL.');
         return res.status(500).json({ error: 'Database error while deleting product.' });
       }
     }
@@ -1621,8 +1876,8 @@ app.delete('/api/products/:id', requireAdmin, async (req, res) => {
     const updatedProducts = products.filter((item) => item.id !== prodId);
     await writeProducts(updatedProducts);
     res.json({ success: true });
-  } catch (error) {
-    console.error('Failed to delete product:', error);
+  } catch {
+    console.error('Failed to delete product.');
     res.status(500).json({ error: 'Unable to delete product.' });
   }
 });
@@ -1633,25 +1888,21 @@ app.get('/api/orders', optionalAuthenticateToken, async (req, res) => {
 
     // 1. Admin gets all orders for management
     if (req.user?.isAdmin) {
+      if (!await isCurrentAdmin(req.user)) return res.status(403).json({ error: 'Forbidden' });
       return res.json(orders);
     }
 
     // 2. Authenticated Customer receives ONLY their own orders (isolated by JWT identity)
     if (req.user && req.user.id) {
-      const userPhoneDigits = req.user.phone ? String(req.user.phone).replace(/[^0-9]/g, '').slice(-10) : '';
       const userEmailLower = req.user.email ? String(req.user.email).toLowerCase() : '';
       const userId = req.user.id;
 
       const customerOrders = orders.filter((o) => {
         const cust = o.customer || {};
-        const orderPhoneDigits = cust.phone ? String(cust.phone).replace(/[^0-9]/g, '').slice(-10) : '';
         const orderEmailLower = cust.email ? String(cust.email).toLowerCase() : '';
 
-        const matchesUserId = cust.userId && cust.userId === userId;
-        const matchesPhone = userPhoneDigits && orderPhoneDigits && userPhoneDigits === orderPhoneDigits;
-        const matchesEmail = userEmailLower && orderEmailLower && userEmailLower === orderEmailLower;
-
-        return matchesUserId || matchesPhone || matchesEmail;
+        if (cust.userId) return String(cust.userId) === String(userId);
+        return userEmailLower && orderEmailLower && userEmailLower === orderEmailLower;
       });
 
       return res.json(customerOrders);
@@ -1659,25 +1910,94 @@ app.get('/api/orders', optionalAuthenticateToken, async (req, res) => {
 
     // 3. Unauthenticated requests return empty array
     return res.json([]);
-  } catch (error) {
-    console.error('Failed to read orders:', error && error.stack ? error.stack : error);
+  } catch {
+    console.error('Failed to read orders.');
     res.status(500).json({ error: 'Unable to read orders.' });
   }
 });
 
-app.post('/api/orders', optionalAuthenticateToken, async (req, res) => {
+app.post('/api/orders', orderRateLimiter, optionalAuthenticateToken, async (req, res) => {
   try {
     const order = normalizeOrderPayload(req.body || {});
-    if (!order.customer || !order.items || !Array.isArray(order.items)) {
+    const submittedCustomer = order.customer;
+    if (!submittedCustomer || typeof submittedCustomer !== 'object' || Array.isArray(submittedCustomer) ||
+        !Array.isArray(order.items) || order.items.length < 1 || order.items.length > 50) {
       return res.status(400).json({ error: 'Order must include customer and items.' });
+    }
+    if (!isValidName(submittedCustomer.name) || !isValidPhone(submittedCustomer.phone) ||
+        typeof submittedCustomer.address !== 'string' || !submittedCustomer.address.trim() || submittedCustomer.address.length > 500 ||
+        typeof submittedCustomer.city !== 'string' || !submittedCustomer.city.trim() || submittedCustomer.city.length > 100 ||
+        !/^\d{6}$/.test(String(submittedCustomer.pincode || '')) ||
+        typeof submittedCustomer.state !== 'string' || !submittedCustomer.state.trim() || submittedCustomer.state.length > 100 ||
+        typeof submittedCustomer.district !== 'string' || !submittedCustomer.district.trim() || submittedCustomer.district.length > 100 ||
+        (submittedCustomer.email && !isValidEmail(submittedCustomer.email))) {
+      return res.status(400).json({ error: 'Enter valid customer and shipping details before placing the order.' });
+    }
+
+    const paymentMethod = String(order.paymentMethod || '').trim().toUpperCase();
+    if (!['COD', 'UPI'].includes(paymentMethod)) {
+      return res.status(400).json({ error: 'Select a valid payment method.' });
+    }
+    if (paymentMethod === 'UPI' && !/^[A-Za-z0-9-]{5,64}$/.test(String(submittedCustomer.transactionId || '').trim())) {
+      return res.status(400).json({ error: 'Enter a valid UPI transaction reference.' });
+    }
+
+    const products = await readProducts();
+    let itemsSubtotal = 0;
+    const verifiedItems = [];
+    for (const item of order.items) {
+      const productId = String(item.product?.id || item.productId || '');
+      const quantity = Number(item.quantity);
+      if (!isValidResourceId(productId) || !Number.isInteger(quantity) || quantity < 1 || quantity > 99) {
+        return res.status(400).json({ error: 'An order item has an invalid product or quantity.' });
+      }
+
+      const product = products.find((candidate) => String(candidate.id) === productId);
+      if (!product || product.visible === false || product.inStock === false) {
+        return res.status(400).json({ error: 'One or more selected products are unavailable.' });
+      }
+
+      const submittedLabel = String(item.weightOption?.label ?? item.weightOption?.weight ?? '');
+      if (!submittedLabel || submittedLabel.length > 64) {
+        return res.status(400).json({ error: 'Select a valid product option.' });
+      }
+
+      let selectedVariant;
+      if (Array.isArray(product.weights) && product.weights.length > 0) {
+        selectedVariant = product.weights.find((variant) => (
+          String(variant.weight ?? variant.label ?? '').trim().toLowerCase() === submittedLabel.trim().toLowerCase()
+        ));
+      } else if (submittedLabel.trim().toLowerCase() === String(product.quantityType || 'Unit').trim().toLowerCase()) {
+        selectedVariant = { weight: product.quantityType || 'Unit', price: product.pricePerUnit };
+      }
+
+      const unitPrice = Number(selectedVariant?.price);
+      if (!selectedVariant || !Number.isFinite(unitPrice) || unitPrice <= 0) {
+        return res.status(400).json({ error: 'A selected product option is no longer available.' });
+      }
+
+      itemsSubtotal += unitPrice * quantity;
+      verifiedItems.push({
+        product: {
+          id: product.id,
+          name: product.name,
+          image: product.image || '',
+          quantityType: product.quantityType || 'Unit',
+        },
+        quantity,
+        weightOption: {
+          label: String(selectedVariant.weight ?? selectedVariant.label ?? product.quantityType ?? 'Unit'),
+          price: unitPrice,
+        },
+      });
     }
 
     // Server attaches verified authenticated customer identity if user is logged in
     if (req.user && !req.user.isAdmin) {
       order.customer.userId = req.user.id;
-      if (req.user.phone) order.customer.phone = req.user.phone;
-      if (req.user.email && !order.customer.email) order.customer.email = req.user.email;
+      order.customer.email = req.user.email;
     }
+    if (req.user?.isAdmin || !req.user) delete order.customer.userId;
 
     // Re-calculate shipping charge server-side — ignore any client-submitted value
     const shippingRules = await readShippingRules();
@@ -1685,32 +2005,32 @@ app.post('/api/orders', optionalAuthenticateToken, async (req, res) => {
     const customerDistrict = order.customer?.district || '';
     const verifiedShippingCharge = calculateShippingCharge(customerState, customerDistrict, shippingRules);
 
-    // Re-compute totalAmount from items + verified shipping charge
-    let itemsSubtotal = 0;
-    if (Array.isArray(order.items)) {
-      order.items.forEach((item) => {
-        itemsSubtotal += (Number(item.weightOption?.price) || 0) * (Number(item.quantity) || 1);
-      });
-    }
     const verifiedTotal = itemsSubtotal + verifiedShippingCharge;
 
     const nextOrder = {
-      ...order,
-      id: order.id || `ORD${Date.now().toString().slice(-8)}`,
-      date: order.date || new Date().toISOString(),
-      status: order.status || 'Order Placed',
-      paymentStatus: order.paymentStatus || 'Pending',
-      paymentMethod: order.paymentMethod || 'COD',
-      trackingNumber: order.trackingNumber || `TRK${Math.floor(100000 + Math.random() * 900000)}`,
+      id: `ORD${crypto.randomUUID()}`,
+      date: new Date().toISOString(),
+      status: 'Order Placed',
+      paymentStatus: 'Pending',
+      paymentMethod,
+      trackingNumber: `TRK${Math.floor(100000 + Math.random() * 900000)}`,
       totalAmount: verifiedTotal,
       customer: {
-        ...order.customer,
+        name: submittedCustomer.name.trim(),
+        email: req.user && !req.user.isAdmin ? req.user.email : String(submittedCustomer.email || '').trim().toLowerCase(),
+        phone: submittedCustomer.phone.trim(),
+        address: submittedCustomer.address.trim(),
+        city: submittedCustomer.city.trim(),
         shippingCharge: verifiedShippingCharge,
         itemsSubtotal,
         state: customerState,
         district: customerDistrict,
-        pincode: order.customer?.pincode || '',
+        pincode: String(submittedCustomer.pincode),
+        transactionId: paymentMethod === 'UPI' ? String(submittedCustomer.transactionId).trim() : '',
+        notes: typeof submittedCustomer.notes === 'string' ? submittedCustomer.notes.trim().slice(0, 1000) : '',
+        ...(req.user && !req.user.isAdmin ? { userId: req.user.id } : {}),
       },
+      items: verifiedItems,
     };
 
     if (isPostgresEnabled && pool) {
@@ -1735,24 +2055,29 @@ app.post('/api/orders', optionalAuthenticateToken, async (req, res) => {
       await writeOrders(existingOrders);
     }
     res.json(nextOrder);
-  } catch (error) {
-    console.error('Failed to create order:', error);
+  } catch {
+    console.error('Failed to create order.');
     res.status(500).json({ error: 'Unable to create order.' });
   }
 });
 
 app.put('/api/orders/:id', requireAdmin, async (req, res) => {
   try {
+    if (!isValidResourceId(req.params.id)) return res.status(400).json({ error: 'Invalid order ID.' });
     const body = req.body || {};
+    if (!body || typeof body !== 'object' || Array.isArray(body) ||
+        Object.keys(body).some((key) => !['status', 'paymentStatus'].includes(key))) {
+      return res.status(400).json({ error: 'Invalid order update.' });
+    }
     const updates = {};
     if (body.status !== undefined) {
-      if (typeof body.status !== 'string' || !body.status.trim()) {
+      if (!['Order Placed', 'Packed', 'Dispatched', 'Delivered', 'Cancelled'].includes(body.status)) {
         return res.status(400).json({ error: 'A valid order status is required.' });
       }
       updates.status = body.status;
     }
     if (body.paymentStatus !== undefined) {
-      if (typeof body.paymentStatus !== 'string' || !body.paymentStatus.trim()) {
+      if (!['Pending', 'Paid'].includes(body.paymentStatus)) {
         return res.status(400).json({ error: 'A valid payment status is required.' });
       }
       updates.paymentStatus = body.paymentStatus;
@@ -1801,14 +2126,15 @@ app.put('/api/orders/:id', requireAdmin, async (req, res) => {
     };
     await writeOrders(orders);
     res.json(orders[index]);
-  } catch (error) {
-    console.error('Failed to update order:', error);
+  } catch {
+    console.error('Failed to update order.');
     res.status(500).json({ error: 'Unable to update order.' });
   }
 });
 
 app.delete('/api/orders/:id', requireAdmin, async (req, res) => {
   try {
+    if (!isValidResourceId(req.params.id)) return res.status(400).json({ error: 'Invalid order ID.' });
     if (isPostgresEnabled && pool) {
       const { rowCount } = await pool.query('DELETE FROM orders WHERE id = $1', [req.params.id]);
       if (rowCount === 0) {
@@ -1824,8 +2150,8 @@ app.delete('/api/orders/:id', requireAdmin, async (req, res) => {
     }
     await writeOrders(updatedOrders);
     res.json({ success: true });
-  } catch (error) {
-    console.error('Failed to delete order:', error);
+  } catch {
+    console.error('Failed to delete order.');
     res.status(500).json({ error: 'Unable to delete order.' });
   }
 });
@@ -1836,11 +2162,16 @@ function generateToken(payload) {
 }
 
 function authenticateToken(req, res, next) {
-  const auth = req.headers.authorization || req.query.token || req.headers['x-access-token'];
-  if (!auth) return res.status(401).json({ error: 'Unauthorized' });
-  const token = auth.startsWith('Bearer ') ? auth.slice(7) : auth;
+  const authorization = req.headers.authorization;
+  if (typeof authorization !== 'string' || !authorization.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const token = authorization.slice(7);
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
+    if (!decoded.id || !decoded.email || typeof decoded.email !== 'string') {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
     req.user = decoded;
     return next();
   } catch {
@@ -1849,102 +2180,98 @@ function authenticateToken(req, res, next) {
 }
 
 function optionalAuthenticateToken(req, res, next) {
-  const auth = req.headers.authorization || req.query.token || req.headers['x-access-token'];
-  if (!auth) {
+  const authorization = req.headers.authorization;
+  if (!authorization) {
     req.user = null;
     return next();
   }
-  const token = auth.startsWith('Bearer ') ? auth.slice(7) : auth;
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded;
-    return next();
-  } catch {
-    req.user = null;
-    return next();
-  }
+  return authenticateToken(req, res, next);
 }
 
 // Register user
 app.post('/api/auth/register', async (req, res) => {
   try {
-    console.log('ROUTE START: /api/auth/register', { isPostgresEnabled, hasPool: Boolean(pool) });
     const { name, email, phone, password } = req.body || {};
-    if (!email || !password || !name) return res.status(400).json({ error: 'Missing required fields' });
-    const cleanEmail = String(email).trim().toLowerCase();
+    if (!isValidName(name) || !isValidEmail(email) || !isValidPassword(password)) {
+      return res.status(400).json({ error: 'Enter a valid name, email address, and password of 8 to 72 bytes.' });
+    }
+    if (phone && !isValidPhone(phone)) {
+      return res.status(400).json({ error: 'Enter a valid phone number.' });
+    }
+    const cleanEmail = email.trim().toLowerCase();
+    const cleanName = name.trim();
+    const cleanPhone = phone ? phone.trim() : '';
     // check existing
     if (isPostgresEnabled && pool) {
-      try {
-        const existing = await runQueryLogged('SELECT id FROM users WHERE LOWER(email) = $1 LIMIT 1', [cleanEmail]);
-        if (existing.rowCount > 0) return res.status(409).json({ error: 'Email already registered' });
-      } catch (err) {
-        console.error('Error while checking existing user', err && err.message);
-        throw err;
-      }
+      const existing = await runQueryLogged('SELECT id FROM users WHERE LOWER(email) = $1 LIMIT 1', [cleanEmail]);
+      if (existing.rowCount > 0) return res.status(409).json({ error: 'Email already registered' });
 
-      const id = `u${Date.now().toString().slice(-8)}`;
-      const hash = await bcrypt.hash(password, 10);
-
-      try {
-        await runQueryLogged('INSERT INTO users (id, name, email, phone, password_hash, is_admin) VALUES ($1,$2,$3,$4,$5,$6)', [id, name, cleanEmail, phone || '', hash, false]);
-      } catch (err) {
-        console.error('Error during INSERT of new user', err && err.message);
-        throw err;
-      }
-
-      console.log('Before JWT generation for new user');
-      const token = generateToken({ id, email: cleanEmail, name, isAdmin: false });
-      console.log('After JWT generation for new user');
-      console.log('Before res.json for register');
-      const out = { id, name, email: cleanEmail, token };
-      res.json(out);
-      console.log('After res.json for register');
-      return;
+      const id = crypto.randomUUID();
+      const hash = await bcrypt.hash(password, 12);
+      await runQueryLogged(
+        'INSERT INTO users (id, name, email, phone, password_hash, is_admin) VALUES ($1,$2,$3,$4,$5,$6)',
+        [id, cleanName, cleanEmail, cleanPhone, hash, false]
+      );
+      const token = generateToken({ id, email: cleanEmail, name: cleanName, isAdmin: false });
+      return res.json({ id, name: cleanName, email: cleanEmail, token });
     }
 
     // JSON fallback
     await ensureStore();
     const profiles = await readJsonFile(userProfilesFile, {});
     if (profiles[cleanEmail]) return res.status(409).json({ error: 'Email already registered' });
-    const id = `u${Date.now().toString().slice(-8)}`;
-    const hash = await bcrypt.hash(password, 10);
-    profiles[cleanEmail] = { id, name, email: cleanEmail, phone: phone || '', password_hash: hash, created_at: new Date().toISOString() };
+    const id = crypto.randomUUID();
+    const hash = await bcrypt.hash(password, 12);
+    profiles[cleanEmail] = { id, name: cleanName, email: cleanEmail, phone: cleanPhone, password_hash: hash, created_at: new Date().toISOString() };
     await writeJsonFile(userProfilesFile, profiles);
-    const token = generateToken({ id, email: cleanEmail, name, isAdmin: false });
-    return res.json({ id, name, email: cleanEmail, token });
-  } catch (error) {
-    console.error('register error', error);
+    const token = generateToken({ id, email: cleanEmail, name: cleanName, isAdmin: false });
+    return res.json({ id, name: cleanName, email: cleanEmail, token });
+  } catch {
+    console.error('Customer registration failed.');
     res.status(500).json({ error: 'Unable to register' });
   }
 });
 
 // Login user
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', loginRateLimiter, async (req, res) => {
   try {
     const { email, password } = req.body || {};
-    if (!email || !password) return res.status(400).json({ error: 'Missing credentials' });
-    const cleanEmail = String(email).trim().toLowerCase();
+    if (!isValidEmail(email) || !isValidPassword(password, 1)) {
+      return res.status(400).json({ error: 'A valid email and password are required.' });
+    }
+    const cleanEmail = email.trim().toLowerCase();
     if (isPostgresEnabled && pool) {
-      const { rows } = await pool.query('SELECT id, name, email, password_hash, is_admin FROM users WHERE LOWER(email) = $1 LIMIT 1', [cleanEmail]);
+      const { rows } = await pool.query('SELECT id, name, email, password_hash FROM users WHERE LOWER(email) = $1 LIMIT 1', [cleanEmail]);
       const user = rows[0];
       if (!user) return res.status(401).json({ error: 'Invalid credentials' });
-      const ok = await bcrypt.compare(password, user.password_hash || '');
+      const storedPassword = String(user.password_hash || '');
+      const ok = await passwordsMatch(storedPassword, password);
       if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
-      const token = generateToken({ id: user.id, email: user.email, name: user.name, isAdmin: !!user.is_admin });
-      return res.json({ id: user.id, name: user.name, email: user.email, token });
+      if (!/^\$2[aby]\$/.test(storedPassword)) {
+        const migratedHash = await bcrypt.hash(password, 12);
+        await pool.query('UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2', [migratedHash, user.id]);
+      }
+      const token = generateToken({ id: user.id, email: user.email, name: user.name, isAdmin: false });
+      return res.json({ id: user.id, name: user.name, email: user.email, isAdmin: false, token });
     } else {
       await ensureStore();
       const profiles = await readJsonFile(userProfilesFile, {});
 
       const profile = profiles[cleanEmail];
       if (!profile) return res.status(401).json({ error: 'Invalid credentials' });
-      const ok = await bcrypt.compare(password, profile.password_hash || '');
+      const storedPassword = String(profile.password_hash || '');
+      const ok = await passwordsMatch(storedPassword, password);
       if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+      if (!/^\$2[aby]\$/.test(storedPassword)) {
+        profile.password_hash = await bcrypt.hash(password, 12);
+        profile.updated_at = new Date().toISOString();
+        await writeJsonFile(userProfilesFile, profiles);
+      }
       const token = generateToken({ id: profile.id, email: profile.email, name: profile.name, isAdmin: false });
       return res.json({ id: profile.id, name: profile.name, email: profile.email, token });
     }
-  } catch (error) {
-    console.error('login error', error);
+  } catch {
+    console.error('Customer login failed.');
     res.status(500).json({ error: 'Unable to login' });
   }
 });
@@ -1953,27 +2280,29 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/auth/profile', authenticateToken, async (req, res) => {
   try {
     if (req.user?.isAdmin) {
+      if (!await isCurrentAdmin(req.user)) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
       return res.json({ id: req.user.id, name: req.user.name || 'Administrator', email: req.user.email, phone: '', isAdmin: true });
     }
 
     const userId = req.user.id;
-    const email = req.user.email;
     if (isPostgresEnabled && pool) {
       const { rows } = await pool.query(
-        'SELECT id, name, email, phone, is_admin FROM users WHERE id = $1 OR (email IS NOT NULL AND LOWER(email) = $2) LIMIT 1',
-        [userId, email?.toLowerCase() || '']
+        'SELECT id, name, email, phone FROM users WHERE id = $1 LIMIT 1',
+        [userId]
       );
       const u = rows[0];
       if (!u) return res.status(404).json({ error: 'Not found' });
-      return res.json({ id: u.id, name: u.name, email: u.email || '', phone: u.phone || '', isAdmin: !!u.is_admin });
+      return res.json({ id: u.id, name: u.name, email: u.email || '', phone: u.phone || '', isAdmin: false });
     }
     await ensureStore();
     const profiles = await readJsonFile(userProfilesFile, {});
-    const p = Object.values(profiles).find((prof) => prof.id === userId || (email && prof.email?.toLowerCase() === email.toLowerCase())) || profiles[email];
+    const p = Object.values(profiles).find((profile) => profile.id === userId);
     if (!p) return res.status(404).json({ error: 'Not found' });
     return res.json({ id: p.id, name: p.name, email: p.email || '', phone: p.phone || '', isAdmin: false });
-  } catch (error) {
-    console.error('profile error', error);
+  } catch {
+    console.error('Failed to read the authenticated profile.');
     res.status(500).json({ error: 'Unable to fetch profile' });
   }
 });
@@ -1981,35 +2310,46 @@ app.get('/api/auth/profile', authenticateToken, async (req, res) => {
 app.put('/api/auth/profile', authenticateToken, async (req, res) => {
   try {
     const updates = req.body || {};
+    if (req.user?.isAdmin) return res.status(403).json({ error: 'Forbidden' });
+    if (!updates || typeof updates !== 'object' || Array.isArray(updates) ||
+        Object.keys(updates).some((key) => !['name', 'phone'].includes(key))) {
+      return res.status(400).json({ error: 'Invalid profile update.' });
+    }
+    if (updates.name !== undefined && !isValidName(updates.name)) {
+      return res.status(400).json({ error: 'Enter a valid name.' });
+    }
+    if (updates.phone !== undefined && updates.phone !== '' && !isValidPhone(updates.phone)) {
+      return res.status(400).json({ error: 'Enter a valid phone number.' });
+    }
+    if (updates.email !== undefined) {
+      return res.status(400).json({ error: 'Email cannot be changed through this endpoint.' });
+    }
     const userId = req.user.id;
-    const email = req.user.email;
     if (isPostgresEnabled && pool) {
       const { rows } = await pool.query(
-        'SELECT id FROM users WHERE id = $1 OR (email IS NOT NULL AND LOWER(email) = $2) LIMIT 1',
-        [userId, email?.toLowerCase() || '']
+        'SELECT id FROM users WHERE id = $1 LIMIT 1',
+        [userId]
       );
       const u = rows[0];
       if (!u) return res.status(404).json({ error: 'Not found' });
       const now = new Date().toISOString();
       await pool.query(
-        'UPDATE users SET name = COALESCE($1, name), phone = COALESCE($2, phone), email = COALESCE($3, email), updated_at = $4 WHERE id = $5',
-        [updates.name || null, updates.phone || null, updates.email || null, now, u.id]
+        'UPDATE users SET name = COALESCE($1, name), phone = COALESCE($2, phone), updated_at = $3 WHERE id = $4',
+        [updates.name || null, updates.phone || null, now, u.id]
       );
       return res.json({ success: true });
     }
     await ensureStore();
     const profiles = await readJsonFile(userProfilesFile, {});
-    let key = Object.keys(profiles).find(k => profiles[k].id === userId || (email && profiles[k].email?.toLowerCase() === email.toLowerCase()));
-    if (!key && email) key = email;
+    const key = Object.keys(profiles).find((profileKey) => profiles[profileKey].id === userId);
     if (!key || !profiles[key]) return res.status(404).json({ error: 'Not found' });
     profiles[key].name = updates.name || profiles[key].name;
     profiles[key].phone = updates.phone || profiles[key].phone;
-    if (updates.email) profiles[key].email = updates.email;
     profiles[key].updated_at = new Date().toISOString();
     await writeJsonFile(userProfilesFile, profiles);
     return res.json({ success: true });
-  } catch (error) {
-    console.error('profile update error', error);
+  } catch {
+    console.error('Failed to update the authenticated profile.');
     res.status(500).json({ error: 'Unable to update profile' });
   }
 });
@@ -2019,16 +2359,13 @@ app.put('/api/auth/profile', authenticateToken, async (req, res) => {
 // ----------------------------------------------------
 
 // 1. Request Password Reset OTP
-app.post(['/api/auth/forgot-password', '/api/auth/forgot'], async (req, res) => {
+app.post(['/api/auth/forgot-password', '/api/auth/forgot'], otpRequestRateLimiter, async (req, res) => {
   try {
     const { email } = req.body || {};
-    if (!email || !String(email).trim()) {
-      return res.status(400).json({ error: 'Email address is required' });
-    }
-    const cleanEmail = String(email).trim().toLowerCase();
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+    if (!isValidEmail(email)) {
       return res.status(400).json({ error: 'Please enter a valid email address.' });
     }
+    const cleanEmail = email.trim().toLowerCase();
 
     const genericResponse = {
       success: true,
@@ -2054,8 +2391,7 @@ app.post(['/api/auth/forgot-password', '/api/auth/forgot'], async (req, res) => 
     }
 
     if (!userExists) {
-      console.info('Password reset OTP dispatch skipped', { result: 'user_not_found' });
-      return res.status(404).json({ error: 'There is no account with this email address.' });
+      return res.json(genericResponse);
     }
 
     // Rate-limiting check: 60 seconds minimum between requests for same email
@@ -2065,7 +2401,7 @@ app.post(['/api/auth/forgot-password', '/api/auth/forgot'], async (req, res) => 
         [cleanEmail]
       );
       if (recent.rows.length > 0) {
-        return res.status(429).json({ error: 'Please wait 60 seconds before requesting another code.' });
+        return res.json(genericResponse);
       }
     }
 
@@ -2088,7 +2424,7 @@ app.post(['/api/auth/forgot-password', '/api/auth/forgot'], async (req, res) => 
       if (profiles[cleanEmail]) {
         const lastRequestedAt = profiles[cleanEmail].pending_otp_created;
         if (lastRequestedAt && Date.now() - new Date(lastRequestedAt).getTime() < 60 * 1000) {
-          return res.status(429).json({ error: 'Please wait 60 seconds before requesting another code.' });
+          return res.json(genericResponse);
         }
         profiles[cleanEmail].pending_otp_hash = otpHash;
         profiles[cleanEmail].pending_otp_expires = expiresAt.toISOString();
@@ -2106,22 +2442,22 @@ app.post(['/api/auth/forgot-password', '/api/auth/forgot'], async (req, res) => 
     });
 
     return res.json(genericResponse);
-  } catch (error) {
-    console.error('forgot-password error:', error);
+  } catch {
+    console.error('Customer password reset request failed.');
     return res.status(500).json({ error: 'Unable to process password reset request.' });
   }
 });
 
 // 2. Verify Password Reset OTP
-app.post('/api/auth/verify-reset-otp', async (req, res) => {
+app.post('/api/auth/verify-reset-otp', otpVerifyRateLimiter, async (req, res) => {
   try {
     const { email, otp } = req.body || {};
-    if (!email || !otp) {
+    if (!isValidEmail(email) || typeof otp !== 'string') {
       return res.status(400).json({ error: 'Email and 6-digit verification code are required' });
     }
 
-    const cleanEmail = String(email).trim().toLowerCase();
-    const cleanOtp = String(otp).trim();
+    const cleanEmail = email.trim().toLowerCase();
+    const cleanOtp = otp.trim();
 
     if (cleanOtp.length !== 6 || !/^\d{6}$/.test(cleanOtp)) {
       return res.status(400).json({ error: 'Verification code must be 6 digits' });
@@ -2129,7 +2465,15 @@ app.post('/api/auth/verify-reset-otp', async (req, res) => {
 
     if (isPostgresEnabled && pool) {
       const { rows } = await runQueryLogged(
-        'SELECT id, otp_hash, attempts, max_attempts, expires_at FROM password_reset_otps WHERE LOWER(email) = $1 AND verified = FALSE AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1',
+        `UPDATE password_reset_otps
+         SET attempts = attempts + 1
+         WHERE id = (
+           SELECT id FROM password_reset_otps
+           WHERE LOWER(email) = $1 AND verified = FALSE AND expires_at > NOW()
+             AND attempts < max_attempts
+           ORDER BY created_at DESC LIMIT 1 FOR UPDATE
+         )
+         RETURNING id, user_id, otp_hash, attempts, max_attempts`,
         [cleanEmail]
       );
 
@@ -2138,16 +2482,9 @@ app.post('/api/auth/verify-reset-otp', async (req, res) => {
         return res.status(400).json({ error: 'Invalid or expired verification code. Please request a new code.' });
       }
 
-      if (record.attempts >= record.max_attempts) {
-        return res.status(429).json({ error: 'Maximum verification attempts exceeded. Please request a new code.' });
-      }
-
-      // Increment attempt count
-      await runQueryLogged('UPDATE password_reset_otps SET attempts = attempts + 1 WHERE id = $1', [record.id]);
-
       const matches = await bcrypt.compare(cleanOtp, record.otp_hash);
       if (!matches) {
-        const remaining = record.max_attempts - (record.attempts + 1);
+        const remaining = Math.max(record.max_attempts - record.attempts, 0);
         return res.status(400).json({
           error: remaining > 0 ? `Incorrect verification code. ${remaining} attempts remaining.` : 'Maximum verification attempts exceeded. Please request a new code.'
         });
@@ -2157,10 +2494,13 @@ app.post('/api/auth/verify-reset-otp', async (req, res) => {
       const rawResetToken = crypto.randomBytes(32).toString('hex');
       const resetTokenHash = await bcrypt.hash(rawResetToken, 10);
 
-      await runQueryLogged(
-        'UPDATE password_reset_otps SET verified = TRUE, reset_token_hash = $1 WHERE id = $2',
+      const consumedOtp = await runQueryLogged(
+        'UPDATE password_reset_otps SET verified = TRUE, reset_token_hash = $1 WHERE id = $2 AND verified = FALSE RETURNING id',
         [resetTokenHash, record.id]
       );
+      if (consumedOtp.rowCount !== 1) {
+        return res.status(400).json({ error: 'Invalid or expired verification code. Please request a new code.' });
+      }
 
       return res.json({
         success: true,
@@ -2188,7 +2528,9 @@ app.post('/api/auth/verify-reset-otp', async (req, res) => {
 
       const rawResetToken = crypto.randomBytes(32).toString('hex');
       p.reset_token_hash = await bcrypt.hash(rawResetToken, 10);
+      p.reset_token_expires = p.pending_otp_expires;
       delete p.pending_otp_hash;
+      delete p.pending_otp_expires;
       delete p.pending_otp_attempts;
       delete p.pending_otp_created;
       await writeJsonFile(userProfilesFile, profiles);
@@ -2198,61 +2540,64 @@ app.post('/api/auth/verify-reset-otp', async (req, res) => {
         resetToken: `${p.id}:${rawResetToken}`
       });
     }
-  } catch (error) {
-    console.error('verify-reset-otp error:', error);
+  } catch {
+    console.error('Customer verification-code check failed.');
     return res.status(500).json({ error: 'Unable to verify verification code.' });
   }
 });
 
 // 3. Reset Password with Reset Token
-app.post('/api/auth/reset-password', async (req, res) => {
+app.post('/api/auth/reset-password', passwordResetRateLimiter, async (req, res) => {
   try {
     const { email, resetToken, newPassword } = req.body || {};
-    if (!email || !resetToken || !newPassword) {
-      return res.status(400).json({ error: 'Missing required parameters.' });
+    if (!isValidEmail(email) || typeof resetToken !== 'string' || !isValidPassword(newPassword)) {
+      return res.status(400).json({ error: 'A valid email, reset token, and password of at least 8 characters are required.' });
     }
 
-    if (newPassword.length < 6) {
-      return res.status(400).json({ error: 'Password must be at least 6 characters long.' });
-    }
-
-    const cleanEmail = String(email).trim().toLowerCase();
+    const cleanEmail = email.trim().toLowerCase();
     const parts = resetToken.split(':');
-    if (parts.length !== 2) {
+    if (parts.length !== 2 || !isValidResourceId(parts[0]) || !/^[a-f0-9]{64}$/i.test(parts[1])) {
       return res.status(400).json({ error: 'Invalid reset session. Please request a new code.' });
     }
 
     const [recordId, rawToken] = parts;
 
     if (isPostgresEnabled && pool) {
-      const { rows } = await runQueryLogged(
-        'SELECT id, reset_token_hash FROM password_reset_otps WHERE id = $1 AND LOWER(email) = $2 AND verified = TRUE AND expires_at > NOW() LIMIT 1',
-        [recordId, cleanEmail]
-      );
-
-      const record = rows[0];
-      if (!record || !record.reset_token_hash) {
-        return res.status(400).json({ error: 'Reset session expired or invalid. Please request a new verification code.' });
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const { rows } = await client.query(
+          'SELECT id, user_id, reset_token_hash FROM password_reset_otps WHERE id = $1 AND LOWER(email) = $2 AND verified = TRUE AND expires_at > NOW() FOR UPDATE',
+          [recordId, cleanEmail]
+        );
+        const record = rows[0];
+        if (!record?.reset_token_hash || !(await bcrypt.compare(rawToken, record.reset_token_hash))) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({ error: 'Reset session expired or invalid. Please request a new verification code.' });
+        }
+        const newHash = await bcrypt.hash(newPassword, 12);
+        const updated = await client.query(
+          'UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2',
+          [newHash, record.user_id]
+        );
+        if (updated.rowCount !== 1) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({ error: 'Reset session expired or invalid. Please request a new verification code.' });
+        }
+        await client.query('DELETE FROM password_reset_otps WHERE id = $1', [record.id]);
+        await client.query('COMMIT');
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally {
+        client.release();
       }
-
-      const validToken = await bcrypt.compare(rawToken, record.reset_token_hash);
-      if (!validToken) {
-        return res.status(400).json({ error: 'Invalid reset session.' });
-      }
-
-      // Hash new password and update user
-      const newHash = await bcrypt.hash(newPassword, 10);
-      await runQueryLogged('UPDATE users SET password_hash = $1, updated_at = NOW() WHERE LOWER(email) = $2', [newHash, cleanEmail]);
-
-      // Delete used OTP records
-      await runQueryLogged('DELETE FROM password_reset_otps WHERE LOWER(email) = $1', [cleanEmail]);
-
       return res.json({ success: true, message: 'Password updated successfully. Please log in with your new password.' });
     } else {
       await ensureStore();
       const profiles = await readJsonFile(userProfilesFile, {});
       const p = profiles[cleanEmail];
-      if (!p || !p.reset_token_hash) {
+      if (!p || !p.reset_token_hash || !p.reset_token_expires || new Date(p.reset_token_expires) <= new Date()) {
         return res.status(400).json({ error: 'Reset session expired or invalid.' });
       }
 
@@ -2263,13 +2608,14 @@ app.post('/api/auth/reset-password', async (req, res) => {
 
       p.password_hash = await bcrypt.hash(newPassword, 10);
       delete p.reset_token_hash;
+      delete p.reset_token_expires;
       p.updated_at = new Date().toISOString();
       await writeJsonFile(userProfilesFile, profiles);
 
       return res.json({ success: true, message: 'Password updated successfully. Please log in.' });
     }
-  } catch (error) {
-    console.error('reset-password error:', error);
+  } catch {
+    console.error('Customer password reset failed.');
     return res.status(500).json({ error: 'Unable to reset password.' });
   }
 });
@@ -2277,7 +2623,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
 app.post('/api/auth/reset', authenticateToken, async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body || {};
-    if (!currentPassword || !newPassword || newPassword.length < 8) {
+    if (req.user?.isAdmin || !isValidPassword(currentPassword, 1) || !isValidPassword(newPassword)) {
       return res.status(400).json({ error: 'Current password and a new password of at least 8 characters are required.' });
     }
 
@@ -2305,18 +2651,21 @@ app.post('/api/auth/reset', authenticateToken, async (req, res) => {
     profile.updated_at = new Date().toISOString();
     await writeJsonFile(userProfilesFile, profiles);
     return res.json({ success: true });
-  } catch (error) {
-    console.error('reset password error', error);
+  } catch {
+    console.error('Failed to reset the authenticated password.');
     res.status(500).json({ error: 'Unable to reset password.' });
   }
 });
 
-app.get('/api/reviews', async (_req, res) => {
+app.get('/api/reviews', optionalAuthenticateToken, async (req, res) => {
   try {
     const reviews = await readReviews();
-    res.json(reviews);
-  } catch (error) {
-    console.error('Failed to read reviews:', error);
+    if (req.user?.isAdmin && !await isCurrentAdmin(req.user)) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    res.json((req.user?.isAdmin ? reviews : reviews.filter((review) => review.visible !== false)).map(toPublicReview));
+  } catch {
+    console.error('Failed to read reviews.');
     res.status(500).json({ error: 'Unable to read reviews.' });
   }
 });
@@ -2328,20 +2677,29 @@ app.post('/api/reviews', authenticateToken, async (req, res) => {
     const product = String(review.product || '').trim();
     const text = String(review.text || '').trim();
     const rating = Number(review.rating);
-    if (!product) return res.status(400).json({ error: 'Select a product before submitting your review.' });
+    const isAdmin = req.user?.isAdmin && await isCurrentAdmin(req.user);
+    if (req.user?.isAdmin && !isAdmin) return res.status(403).json({ error: 'Forbidden' });
+    if (!product || product.length > 100) return res.status(400).json({ error: 'Select a valid product before submitting your review.' });
+    if (!isAdmin && product.toLowerCase() !== 'j&d foods' &&
+        !(await readProducts()).some((item) => String(item.name || '').trim().toLowerCase() === product.toLowerCase())) {
+      return res.status(400).json({ error: 'Select a valid product before submitting your review.' });
+    }
+    if (isAdmin && !isValidName(review.name, 100)) return res.status(400).json({ error: 'Enter a valid reviewer name.' });
     if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
       return res.status(400).json({ error: 'Rating must be between 1 and 5 stars.' });
     }
-    if (!text) return res.status(400).json({ error: 'Write your review before submitting.' });
+    if (!text || text.length > 2000 || containsControlCharacters(text)) {
+      return res.status(400).json({ error: 'Write a valid review of no more than 2,000 characters.' });
+    }
 
     const reviews = await readReviews();
     const userId = req.user.id;
     const userEmail = req.user.email;
-    const userName = req.user.name || req.user.email;
+    const userName = isAdmin ? review.name.trim() : (req.user.name || req.user.email);
 
     const normalizedProduct = product.toLocaleLowerCase();
     const normalizedEmail = String(userEmail || '').toLocaleLowerCase();
-    const exists = reviews.find((existingReview) => (
+    const exists = isAdmin ? null : reviews.find((existingReview) => (
       String(existingReview.product || '').trim().toLocaleLowerCase() === normalizedProduct &&
       (
         (userId && String(existingReview.user_id || '') === String(userId)) ||
@@ -2353,6 +2711,12 @@ app.post('/api/reviews', authenticateToken, async (req, res) => {
     }
 
     const now = new Date().toISOString();
+    const customerOrders = isAdmin ? [] : await readOrders();
+    const verifiedBuyer = !isAdmin && customerOrders.some((order) => {
+      const customer = order.customer || {};
+      return (customer.userId && String(customer.userId) === String(userId)) ||
+        (customer.email && String(customer.email).trim().toLowerCase() === normalizedEmail);
+    });
     const nextReview = {
       id: crypto.randomUUID(),
       name: userName,
@@ -2360,11 +2724,9 @@ app.post('/api/reviews', authenticateToken, async (req, res) => {
       rating,
       date: now,
       visible: true,
-      verifiedBuyer: true,
+      verifiedBuyer,
       text,
-      user_id: userId,
-      user_email: userEmail,
-      user_name: userName,
+      ...(isAdmin ? {} : { user_id: userId, user_email: userEmail, user_name: userName }),
       created_at: now,
       updated_at: now,
     };
@@ -2394,9 +2756,9 @@ app.post('/api/reviews', authenticateToken, async (req, res) => {
       await writeReviews(reviews);
     }
 
-    res.json(nextReview);
-  } catch (error) {
-    console.error('Failed to create review:', error);
+    res.json(toPublicReview(nextReview));
+  } catch {
+    console.error('Failed to create review.');
     res.status(500).json({ error: 'Unable to create review.' });
   }
 });
@@ -2404,14 +2766,15 @@ app.post('/api/reviews', authenticateToken, async (req, res) => {
 // Delete review (admin only)
 app.delete('/api/reviews/:id', requireAdmin, async (req, res) => {
   try {
+    if (!isValidResourceId(req.params.id)) return res.status(400).json({ error: 'Invalid review ID.' });
     const reviews = await readReviews();
     const index = reviews.findIndex((item) => String(item.id) === String(req.params.id));
     if (index < 0) return res.status(404).json({ error: 'Review not found' });
     const updated = reviews.filter((item) => String(item.id) !== String(req.params.id));
     await writeReviews(updated);
     res.json({ success: true });
-  } catch (error) {
-    console.error('Failed to delete review:', error);
+  } catch {
+    console.error('Failed to delete review.');
     res.status(500).json({ error: 'Unable to delete review.' });
   }
 });
@@ -2419,34 +2782,62 @@ app.delete('/api/reviews/:id', requireAdmin, async (req, res) => {
 // Update review (auth + ownership or admin)
 app.put('/api/reviews/:id', authenticateToken, async (req, res) => {
   try {
+    if (!isValidResourceId(req.params.id)) return res.status(400).json({ error: 'Invalid review ID.' });
     const updates = req.body || {};
+    const allowedFields = req.user?.isAdmin ? ['name', 'text', 'rating', 'visible'] : ['text', 'rating'];
+    if (!updates || typeof updates !== 'object' || Array.isArray(updates) ||
+        Object.keys(updates).some((key) => !allowedFields.includes(key))) {
+      return res.status(400).json({ error: 'Invalid review update.' });
+    }
+    if (updates.text !== undefined &&
+        (typeof updates.text !== 'string' || !updates.text.trim() || updates.text.length > 2000 ||
+         containsControlCharacters(updates.text))) {
+      return res.status(400).json({ error: 'Write a valid review of no more than 2,000 characters.' });
+    }
+    if (updates.name !== undefined && (!req.user?.isAdmin || !isValidName(updates.name, 100))) {
+      return res.status(400).json({ error: 'Enter a valid reviewer name.' });
+    }
+    if (updates.rating !== undefined && (!Number.isInteger(Number(updates.rating)) || Number(updates.rating) < 1 || Number(updates.rating) > 5)) {
+      return res.status(400).json({ error: 'Rating must be between 1 and 5 stars.' });
+    }
+    if (updates.visible !== undefined && (typeof updates.visible !== 'boolean' || !req.user?.isAdmin)) {
+      return res.status(400).json({ error: 'Invalid review visibility.' });
+    }
     const reviews = await readReviews();
-    const index = reviews.findIndex((item) => item.id === req.params.id);
+    const index = reviews.findIndex((item) => String(item.id) === req.params.id);
     if (index < 0) return res.status(404).json({ error: 'Review not found' });
     const target = reviews[index];
-    const isOwner = req.user.isAdmin || (target.user_id && target.user_id === req.user.id) || (target.user_email && target.user_email === req.user.email);
+    const isOwner = req.user.isAdmin
+      ? await isCurrentAdmin(req.user)
+      : (target.user_id && String(target.user_id) === String(req.user.id)) ||
+        (target.user_email && String(target.user_email).trim().toLowerCase() === String(req.user.email).trim().toLowerCase());
     if (!isOwner) return res.status(403).json({ error: 'Forbidden' });
+    const safeUpdates = { ...updates };
+    if (safeUpdates.text !== undefined) safeUpdates.text = safeUpdates.text.trim();
+    if (safeUpdates.rating !== undefined) safeUpdates.rating = Number(safeUpdates.rating);
+    if (safeUpdates.name !== undefined) safeUpdates.name = safeUpdates.name.trim();
     const now = new Date().toISOString();
     reviews[index] = {
       ...reviews[index],
-      ...updates,
+      ...safeUpdates,
       updated_at: now,
-      id: req.params.id,
+      id: reviews[index].id,
     };
     await writeReviews(reviews);
-    res.json(reviews[index]);
-  } catch (error) {
-    console.error('Failed to update review:', error);
+    res.json(toPublicReview(reviews[index]));
+  } catch {
+    console.error('Failed to update review.');
     res.status(500).json({ error: 'Unable to update review.' });
   }
 });
 
-app.get('/api/offers', async (_req, res) => {
+app.get('/api/offers', optionalAuthenticateToken, async (req, res) => {
   try {
     const offers = await readOffers();
-    res.json(offers);
-  } catch (error) {
-    console.error('Failed to read offers:', error);
+    if (req.user?.isAdmin && !await isCurrentAdmin(req.user)) return res.status(403).json({ error: 'Forbidden' });
+    res.json(req.user?.isAdmin ? offers : offers.filter((offer) => offer.active !== false));
+  } catch {
+    console.error('Failed to read offers.');
     res.status(500).json({ error: 'Unable to read offers.' });
   }
 });
@@ -2454,6 +2845,18 @@ app.get('/api/offers', async (_req, res) => {
 app.post('/api/offers', requireAdmin, async (req, res) => {
   try {
     const offer = req.body || {};
+    if (!offer || typeof offer !== 'object' || Array.isArray(offer) ||
+        Object.keys(offer).some((key) => !['id', 'code', 'title', 'description', 'discount', 'active', 'productId', 'minOrderValue'].includes(key)) ||
+        (offer.id !== undefined && offer.id !== '' && !isValidResourceId(String(offer.id))) ||
+        typeof offer.code !== 'string' || !/^[A-Za-z0-9_-]{2,32}$/.test(offer.code.trim()) ||
+        typeof offer.title !== 'string' || !offer.title.trim() || offer.title.length > 150 ||
+        (offer.description !== undefined && (typeof offer.description !== 'string' || offer.description.length > 1000)) ||
+        !Number.isFinite(Number(offer.discount)) || Number(offer.discount) < 0 || Number(offer.discount) > 100 ||
+        (offer.active !== undefined && typeof offer.active !== 'boolean') ||
+        (offer.productId !== undefined && offer.productId !== '' && !isValidResourceId(String(offer.productId))) ||
+        !isNonNegativeAmount(offer.minOrderValue ?? 0)) {
+      return res.status(400).json({ error: 'Enter valid offer details.' });
+    }
     const offers = await readOffers();
     const nextOffer = {
       ...offer,
@@ -2474,20 +2877,21 @@ app.post('/api/offers', requireAdmin, async (req, res) => {
     }
     await writeOffers(offers);
     res.json(nextOffer);
-  } catch (error) {
-    console.error('Failed to save offer:', error);
+  } catch {
+    console.error('Failed to save offer.');
     res.status(500).json({ error: 'Unable to save offer.' });
   }
 });
 
 app.delete('/api/offers/:id', requireAdmin, async (req, res) => {
   try {
+    if (!isValidResourceId(req.params.id)) return res.status(400).json({ error: 'Invalid offer ID.' });
     const offers = await readOffers();
     const updatedOffers = offers.filter((item) => item.id !== req.params.id);
     await writeOffers(updatedOffers);
     res.json({ success: true });
-  } catch (error) {
-    console.error('Failed to delete offer:', error);
+  } catch {
+    console.error('Failed to delete offer.');
     res.status(500).json({ error: 'Unable to delete offer.' });
   }
 });
@@ -2496,8 +2900,8 @@ app.get('/api/store-settings', async (_req, res) => {
   try {
     const settings = await readStoreSettings();
     res.json(settings);
-  } catch (error) {
-    console.error('Failed to read store settings:', error);
+  } catch {
+    console.error('Failed to read store settings.');
     res.status(500).json({ error: 'Unable to read store settings.' });
   }
 });
@@ -2505,10 +2909,21 @@ app.get('/api/store-settings', async (_req, res) => {
 app.post('/api/store-settings', requireAdmin, async (req, res) => {
   try {
     const settings = req.body || {};
+    if (!isValidSettingsObject(settings) ||
+        (settings.businessName !== undefined && !isValidName(settings.businessName, 150)) ||
+        (settings.contactNumber !== undefined && !isValidPhone(settings.contactNumber)) ||
+        (settings.whatsappNumber !== undefined && !isValidPhone(settings.whatsappNumber)) ||
+        (settings.email !== undefined && !isValidEmail(settings.email)) ||
+        (settings.logoUrl !== undefined && !isSafeImageUrl(settings.logoUrl)) ||
+        (settings.heroBackgroundUrl !== undefined && !isSafeImageUrl(settings.heroBackgroundUrl)) ||
+        (settings.featureImageUrl !== undefined && !isSafeImageUrl(settings.featureImageUrl)) ||
+        (settings.address !== undefined && (typeof settings.address !== 'string' || settings.address.length > 500))) {
+      return res.status(400).json({ error: 'Enter valid store settings.' });
+    }
     const saved = await writeStoreSettings(settings);
     res.json(saved);
-  } catch (error) {
-    console.error('Failed to save store settings:', error);
+  } catch {
+    console.error('Failed to save store settings.');
     res.status(500).json({ error: 'Unable to save store settings.' });
   }
 });
@@ -2517,8 +2932,8 @@ app.get('/api/payment-settings', async (_req, res) => {
   try {
     const settings = await readPaymentSettings();
     res.json(settings);
-  } catch (error) {
-    console.error('Failed to read payment settings:', error);
+  } catch {
+    console.error('Failed to read payment settings.');
     res.status(500).json({ error: 'Unable to read payment settings.' });
   }
 });
@@ -2526,10 +2941,18 @@ app.get('/api/payment-settings', async (_req, res) => {
 app.post('/api/payment-settings', requireAdmin, async (req, res) => {
   try {
     const settings = req.body || {};
+    if (!isValidSettingsObject(settings) ||
+        (settings.qrImage !== undefined && !isSafeImageUrl(settings.qrImage)) ||
+        (settings.upiId !== undefined && (typeof settings.upiId !== 'string' || !/^[A-Za-z0-9._-]{2,100}@[A-Za-z0-9.-]{2,100}$/.test(settings.upiId))) ||
+        (settings.phone !== undefined && !isValidPhone(settings.phone)) ||
+        ['enableCOD', 'enableUPI', 'enableScanner'].some((key) => settings[key] !== undefined && typeof settings[key] !== 'boolean') ||
+        ['scannerNote', 'instructions'].some((key) => settings[key] !== undefined && (typeof settings[key] !== 'string' || settings[key].length > 2000))) {
+      return res.status(400).json({ error: 'Enter valid payment settings.' });
+    }
     const saved = await writePaymentSettings(settings);
     res.json(saved);
-  } catch (error) {
-    console.error('Failed to save payment settings:', error);
+  } catch {
+    console.error('Failed to save payment settings.');
     res.status(500).json({ error: 'Unable to save payment settings.' });
   }
 });
@@ -2538,8 +2961,8 @@ app.get('/api/admin-profile', requireAdmin, async (_req, res) => {
   try {
     const profile = await readAdminProfile();
     res.json(profile);
-  } catch (error) {
-    console.error('Failed to read admin profile:', error);
+  } catch {
+    console.error('Failed to read admin profile.');
     res.status(500).json({ error: 'Unable to read admin profile.' });
   }
 });
@@ -2547,10 +2970,25 @@ app.get('/api/admin-profile', requireAdmin, async (_req, res) => {
 app.post('/api/admin-profile', requireAdmin, async (req, res) => {
   try {
     const profile = req.body || {};
+    if (!isValidSettingsObject(profile) ||
+        (profile.ownerName !== undefined && !isValidName(profile.ownerName, 150)) ||
+        (profile.businessName !== undefined && !isValidName(profile.businessName, 150)) ||
+        (profile.email !== undefined && !isValidEmail(profile.email)) ||
+        (profile.phone !== undefined && !isValidPhone(profile.phone)) ||
+        (profile.whatsapp !== undefined && !isValidPhone(profile.whatsapp)) ||
+        ['instagram', 'mapLink', 'profileImage', 'logoImage'].some((key) => (
+          profile[key] !== undefined && (
+            typeof profile[key] !== 'string' || profile[key].length > 2000 ||
+            (profile[key] !== '' && !/^https:\/\/[^\s]+$/i.test(profile[key]))
+          )
+        )) ||
+        (profile.address !== undefined && (typeof profile.address !== 'string' || profile.address.length > 500))) {
+      return res.status(400).json({ error: 'Enter valid admin profile details.' });
+    }
     const saved = await writeAdminProfile(profile);
     res.json(saved);
-  } catch (error) {
-    console.error('Failed to save admin profile:', error);
+  } catch {
+    console.error('Failed to save admin profile.');
     res.status(500).json({ error: 'Unable to save admin profile.' });
   }
 });
@@ -2559,8 +2997,8 @@ app.get('/api/product-types', async (_req, res) => {
   try {
     const types = await readProductTypes();
     res.json(types);
-  } catch (error) {
-    console.error('Failed to read product types:', error);
+  } catch {
+    console.error('Failed to read product types.');
     res.status(500).json({ error: 'Unable to read product types.' });
   }
 });
@@ -2568,44 +3006,80 @@ app.get('/api/product-types', async (_req, res) => {
 app.post('/api/product-types', requireAdmin, async (req, res) => {
   try {
     const types = req.body || [];
-    if (!Array.isArray(types)) {
-      return res.status(400).json({ error: 'Product types must be an array.' });
+    if (!Array.isArray(types) || types.length > 100 ||
+        types.some((type) => typeof type !== 'string' || !type.trim() || type.trim().length > 100) ||
+        new Set(types.map((type) => String(type).trim().toLowerCase())).size !== types.length) {
+      return res.status(400).json({ error: 'Enter a valid list of product types.' });
     }
     const saved = await writeProductTypes(types);
     res.json(saved);
-  } catch (error) {
-    console.error('Failed to save product types:', error);
+  } catch {
+    console.error('Failed to save product types.');
     res.status(500).json({ error: 'Unable to save product types.' });
   }
 });
 
-app.get('/api/user-profiles/:email', authenticateToken, async (req, res) => {
+app.get('/api/user-profiles/:email', authenticateOwnerOrAdmin, async (req, res) => {
   try {
     const email = String(req.params.email || '').trim().toLowerCase();
-    if (!email) return res.status(400).json({ error: 'Email is required.' });
-    if (!req.user.isAdmin && req.user.email !== email) {
+    if (!isValidEmail(email)) return res.status(400).json({ error: 'A valid email is required.' });
+    if (!req.user.isAdmin && String(req.user.email).trim().toLowerCase() !== email) {
       return res.status(403).json({ error: 'Forbidden' });
     }
     const profile = await readUserProfile(email);
     res.json(profile);
-  } catch (error) {
-    console.error('Failed to read user profile:', error);
+  } catch {
+    console.error('Failed to read user profile.');
     res.status(500).json({ error: 'Unable to read user profile.' });
   }
 });
 
-app.post('/api/user-profiles/:email', authenticateToken, async (req, res) => {
+app.post('/api/user-profiles/:email', authenticateOwnerOrAdmin, async (req, res) => {
   try {
     const email = String(req.params.email || '').trim().toLowerCase();
-    if (!email) return res.status(400).json({ error: 'Email is required.' });
-    if (!req.user.isAdmin && req.user.email !== email) {
+    if (!isValidEmail(email)) return res.status(400).json({ error: 'A valid email is required.' });
+    if (!req.user.isAdmin && String(req.user.email).trim().toLowerCase() !== email) {
       return res.status(403).json({ error: 'Forbidden' });
     }
-    const profile = req.body || {};
-    const saved = await writeUserProfile(email, profile);
+    const profile = req.body;
+    if (!profile || typeof profile !== 'object' || Array.isArray(profile) ||
+        Object.keys(profile).some((key) => !['name', 'email', 'phone', 'addresses', 'wishlist'].includes(key))) {
+      return res.status(400).json({ error: 'Invalid profile data.' });
+    }
+    if (profile.name !== undefined && profile.name !== '' && !isValidName(profile.name)) {
+      return res.status(400).json({ error: 'Enter a valid profile name.' });
+    }
+    if (profile.phone !== undefined && profile.phone !== '' && !isValidPhone(profile.phone)) {
+      return res.status(400).json({ error: 'Enter a valid phone number.' });
+    }
+    if (profile.addresses !== undefined) {
+      if (!Array.isArray(profile.addresses) || profile.addresses.length > 20 ||
+          profile.addresses.some((address) => (
+            !address || typeof address !== 'object' || Array.isArray(address) ||
+            Object.keys(address).some((key) => !['id', 'label', 'name', 'phone', 'street', 'city', 'state', 'pincode', 'landmark'].includes(key)) ||
+            !isValidResourceId(String(address.id || '')) ||
+            (address.phone && !isValidPhone(address.phone)) ||
+            (address.pincode && !/^\d{6}$/.test(String(address.pincode))) ||
+            ['label', 'name', 'street', 'city', 'state', 'landmark'].some((key) => (
+              address[key] !== undefined && (typeof address[key] !== 'string' || address[key].length > 500)
+            ))
+          ))) {
+        return res.status(400).json({ error: 'One or more saved addresses are invalid.' });
+      }
+    }
+    if (profile.wishlist !== undefined &&
+        (!Array.isArray(profile.wishlist) || profile.wishlist.length > 500 ||
+         profile.wishlist.some((id) => !isValidResourceId(String(id))))) {
+      return res.status(400).json({ error: 'Wishlist contains an invalid product ID.' });
+    }
+    if (profile.email !== undefined && String(profile.email).trim().toLowerCase() !== email) {
+      return res.status(400).json({ error: 'Profile email cannot be changed.' });
+    }
+    const currentProfile = await readUserProfile(email);
+    const saved = await writeUserProfile(email, { ...currentProfile, ...profile, email });
     res.json(saved);
-  } catch (error) {
-    console.error('Failed to save user profile:', error);
+  } catch {
+    console.error('Failed to save user profile.');
     res.status(500).json({ error: 'Unable to save user profile.' });
   }
 });
@@ -2624,8 +3098,8 @@ app.get('/api/customers', requireAdmin, async (_req, res) => {
   try {
     const customers = await readCustomers();
     res.json(customers);
-  } catch (error) {
-    console.error('Failed to read customers:', error);
+  } catch {
+    console.error('Failed to read customers.');
     res.status(500).json({ error: 'Unable to read customers.' });
   }
 });
@@ -2636,8 +3110,8 @@ app.get('/api/shipping-rules', async (_req, res) => {
   try {
     const rules = await readShippingRules();
     res.json(rules);
-  } catch (error) {
-    console.error('Failed to read shipping rules:', error);
+  } catch {
+    console.error('Failed to read shipping rules.');
     res.status(500).json({ error: 'Unable to read shipping rules.' });
   }
 });
@@ -2645,16 +3119,35 @@ app.get('/api/shipping-rules', async (_req, res) => {
 app.post('/api/shipping-rules', requireAdmin, async (req, res) => {
   try {
     const rules = req.body || {};
+    const validCharge = (value) => Number.isFinite(Number(value)) && Number(value) >= 0 && Number(value) <= 100_000;
+    if (!rules || typeof rules !== 'object' || Array.isArray(rules) ||
+        !validCharge(rules.defaultCharge) || !rules.states || typeof rules.states !== 'object' || Array.isArray(rules.states) ||
+        Object.keys(rules.states).length > 100 ||
+        Object.entries(rules.states).some(([stateName, state]) => (
+          !stateName.trim() || stateName.length > 100 ||
+          !state || typeof state !== 'object' || Array.isArray(state) ||
+          (state.defaultCharge !== undefined && !validCharge(state.defaultCharge)) ||
+          !state.districts || typeof state.districts !== 'object' || Array.isArray(state.districts) ||
+          Object.keys(state.districts).length > 200 ||
+          Object.entries(state.districts).some(([districtName, district]) => (
+            !districtName.trim() || districtName.length > 100 ||
+            (typeof district === 'object' && district !== null
+              ? (!validCharge(district.charge) || (district.active !== undefined && typeof district.active !== 'boolean'))
+              : !validCharge(district))
+          ))
+        ))) {
+      return res.status(400).json({ error: 'Enter valid shipping rules.' });
+    }
     const saved = await writeShippingRules(rules);
     res.json(saved);
-  } catch (error) {
-    console.error('Failed to save shipping rules:', error);
+  } catch {
+    console.error('Failed to save shipping rules.');
     res.status(500).json({ error: 'Unable to save shipping rules.' });
   }
 });
 
 // PIN code lookup — proxies api.postalpincode.in and enriches with shipping charge
-app.get('/api/pincode/:pin', async (req, res) => {
+app.get('/api/pincode/:pin', pinLookupRateLimiter, async (req, res) => {
   const pin = String(req.params.pin || '').trim();
   if (!/^[0-9]{6}$/.test(pin)) {
     return res.status(400).json({ valid: false, error: 'Invalid PIN code. Must be 6 digits.' });
@@ -2692,10 +3185,27 @@ app.get('/api/pincode/:pin', async (req, res) => {
       circle,
       shippingCharge,
     });
-  } catch (error) {
-    console.error('PIN lookup error:', error && error.message);
+  } catch {
+    console.error('PIN lookup failed.');
     return res.status(502).json({ valid: false, error: 'Unable to look up PIN code. Please try again.' });
   }
+});
+
+app.use((error, _req, res, next) => {
+  if (res.headersSent) return next(error);
+  const status = Number(error?.status || error?.statusCode) || 500;
+  const safeStatus = [400, 403, 413, 429].includes(status) ? status : 500;
+  const message = safeStatus === 413
+    ? 'Request body is too large.'
+    : safeStatus === 400
+      ? 'Invalid request data.'
+      : safeStatus === 403
+        ? 'Request origin is not allowed.'
+        : safeStatus === 429
+          ? 'Too many requests. Please try again later.'
+          : 'An unexpected server error occurred.';
+  if (safeStatus === 500) console.error('Request middleware failed.');
+  return res.status(safeStatus).json({ error: message });
 });
 
 const port = Number(process.env.PORT || 3001);
@@ -2719,8 +3229,8 @@ async function startServer() {
         console.log('Connected to PostgreSQL via DATABASE_URL');
       }
     });
-  } catch (err) {
-    console.error('Startup failed during database initialization:', err && (err.stack || err.message || err));
+  } catch {
+    console.error('Startup failed during database initialization.');
     process.exit(1);
   }
 }
