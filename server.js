@@ -1363,6 +1363,11 @@ const isSafeImageUrl = (value) => (
     /^https:\/\/[^\s]+$/i.test(value) ||
     /^data:image\/(?:png|jpeg|webp);base64,[a-z0-9+/=]+$/i.test(value))
 );
+const isSafeVideoUrl = (value) => (
+  typeof value === 'string' &&
+  value.length <= 2_048 &&
+  (!value || (value.startsWith('/') && !value.startsWith('//')) || /^https:\/\/[^\s]+$/i.test(value))
+);
 const isBoundedJsonData = (value, depth = 0) => {
   if (depth > 8) return false;
   if (value === null || typeof value === 'boolean') return true;
@@ -3062,6 +3067,7 @@ app.post('/api/store-settings', requireAdmin, async (req, res) => {
         (settings.featureImageUrl !== undefined && !isSafeImageUrl(settings.featureImageUrl)) ||
         (settings.heroDesktopImageUrl !== undefined && !isSafeImageUrl(settings.heroDesktopImageUrl)) ||
         (settings.heroMobileImageUrl !== undefined && !isSafeImageUrl(settings.heroMobileImageUrl)) ||
+        (settings.heroVideoUrl !== undefined && !isSafeVideoUrl(settings.heroVideoUrl)) ||
         (settings.heroTitle !== undefined && (typeof settings.heroTitle !== 'string' || settings.heroTitle.length > 100)) ||
         (settings.heroSubtitle !== undefined && (typeof settings.heroSubtitle !== 'string' || settings.heroSubtitle.length > 300)) ||
         (settings.logoZoom !== undefined && (typeof settings.logoZoom !== 'number' || !Number.isFinite(settings.logoZoom) || settings.logoZoom < 1 || settings.logoZoom > 3)) ||
