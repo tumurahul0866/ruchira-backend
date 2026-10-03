@@ -100,6 +100,7 @@ const PRODUCT_COLUMNS = [
   'additional_images',
   'combo_product_ids',
   'combo_product_quantities',
+  'combo_product_variants',
 ];
 
 const productInsertQuery = `
@@ -128,7 +129,8 @@ const productInsertQuery = `
     image = EXCLUDED.image,
     additional_images = EXCLUDED.additional_images,
     combo_product_ids = EXCLUDED.combo_product_ids,
-    combo_product_quantities = EXCLUDED.combo_product_quantities;
+    combo_product_quantities = EXCLUDED.combo_product_quantities,
+    combo_product_variants = EXCLUDED.combo_product_variants;
 `;
 
 function parseJsonValue(value) {
@@ -145,6 +147,7 @@ function normalizeProduct(product) {
   const additionalImages = parseJsonValue(product.additionalImages ?? product.additional_images);
   const comboProductIds = parseJsonValue(product.comboProductIds ?? product.combo_product_ids);
   const comboProductQuantities = parseJsonValue(product.comboProductQuantities ?? product.combo_product_quantities);
+  const comboProductVariants = parseJsonValue(product.comboProductVariants ?? product.combo_product_variants);
 
   return {
     id: product.id,
@@ -173,7 +176,25 @@ function normalizeProduct(product) {
     comboProductQuantities: comboProductQuantities && typeof comboProductQuantities === 'object' && !Array.isArray(comboProductQuantities)
       ? comboProductQuantities
       : {},
+    comboProductVariants: comboProductVariants && typeof comboProductVariants === 'object' && !Array.isArray(comboProductVariants)
+      ? comboProductVariants
+      : {},
   };
+}
+
+function getComboProductOption(product, requestedLabel) {
+  const weights = Array.isArray(product.weights) ? product.weights : [];
+  const variants = weights.length > 0
+    ? weights.map((weight) => ({
+      label: String(weight.weight ?? weight.label ?? ''),
+      price: Number(weight.price) || 0,
+    }))
+    : [{
+      label: String(product.quantityType || 'Unit'),
+      price: Number(product.pricePerUnit) || 0,
+    }];
+  return variants.find((variant) => variant.label.trim().toLowerCase() === String(requestedLabel || '').trim().toLowerCase())
+    || (requestedLabel ? null : variants[0]);
 }
 
 function getComboProductUnit(product) {
@@ -199,7 +220,9 @@ function withComboProductDetails(products, sourceProducts = products) {
           image: comboProduct.image || '',
           productType: comboProduct.productType || 'Product',
           category: comboProduct.category || '',
-          price: Number(comboProduct.pricePerUnit) || Number(comboProduct.weights?.[0]?.price) || 0,
+          variantLabel: getComboProductOption(comboProduct, product.comboProductVariants?.[String(comboProduct.id)])?.label
+            || String(comboProduct.quantityType || 'Unit'),
+          price: getComboProductOption(comboProduct, product.comboProductVariants?.[String(comboProduct.id)])?.price || 0,
           quantity: Number(product.comboProductQuantities?.[String(comboProduct.id)]) || 1,
           unit: getComboProductUnit(comboProduct),
         })),
@@ -217,6 +240,11 @@ function normalizeProductInput(item) {
       ? item.comboProductQuantities
       : item.combo_product_quantities && typeof item.combo_product_quantities === 'object' && !Array.isArray(item.combo_product_quantities)
       ? item.combo_product_quantities
+      : {},
+    comboProductVariants: item.comboProductVariants && typeof item.comboProductVariants === 'object' && !Array.isArray(item.comboProductVariants)
+      ? Object.fromEntries(Object.entries(item.comboProductVariants).map(([id, label]) => [String(id), String(label)]))
+      : item.combo_product_variants && typeof item.combo_product_variants === 'object' && !Array.isArray(item.combo_product_variants)
+      ? Object.fromEntries(Object.entries(item.combo_product_variants).map(([id, label]) => [String(id), String(label)]))
       : {},
     quantityType: item.quantityType ?? item.quantity_type ?? 'Weight',
     pricePerUnit: Number(item.pricePerUnit ?? item.price_per_unit) || 0,
@@ -296,6 +324,9 @@ function productRowParams(product) {
     JSON.stringify(product.comboProductQuantities && typeof product.comboProductQuantities === 'object' && !Array.isArray(product.comboProductQuantities)
       ? product.comboProductQuantities
       : {}),
+    JSON.stringify(product.comboProductVariants && typeof product.comboProductVariants === 'object' && !Array.isArray(product.comboProductVariants)
+      ? product.comboProductVariants
+      : {}),
   ];
 }
 
@@ -348,7 +379,8 @@ async function ensureDatabase() {
       image TEXT,
       additional_images JSONB,
       combo_product_ids JSONB,
-      combo_product_quantities JSONB
+      combo_product_quantities JSONB,
+      combo_product_variants JSONB
     );
   `), 'create products');
   console.log('DB init: products table ready');
@@ -362,6 +394,11 @@ async function ensureDatabase() {
     ALTER TABLE products ADD COLUMN IF NOT EXISTS combo_product_quantities JSONB;
   `), 'add combo_product_quantities column');
   console.log('DB init: combo_product_quantities column ready');
+
+  await withDbTimeout(runQueryLogged(`
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS combo_product_variants JSONB;
+  `), 'add combo_product_variants column');
+  console.log('DB init: combo_product_variants column ready');
 
   console.log('DB init: adding quantity_type column');
   await withDbTimeout(runQueryLogged(`
@@ -1353,6 +1390,11 @@ const isValidPhone = (value) => (
   value.replace(/\D/g, '').length >= 7 &&
   value.replace(/\D/g, '').length <= 15
 );
+const isValidWhatsAppContact = (value) => (
+  typeof value === 'string' &&
+  (value === '' || isValidPhone(value) ||
+    (value.length <= 2_048 && /^https:\/\/(?:wa\.me\/[^\s]+|api\.whatsapp\.com\/send(?:\?[^\s]*)?)$/i.test(value)))
+);
 const isValidResourceId = (value) => (
   typeof value === 'string' &&
   value.length > 0 &&
@@ -1445,6 +1487,23 @@ const validateProductInput = (product, isUpdate = false) => {
   if (!isComboProduct && Object.keys(product.comboProductQuantities || {}).length > 0) {
     return 'Only combo products can have included product quantities.';
   }
+  if (product.comboProductVariants !== undefined && (
+    !product.comboProductVariants ||
+    typeof product.comboProductVariants !== 'object' ||
+    Array.isArray(product.comboProductVariants) ||
+    Object.entries(product.comboProductVariants).some(([id, label]) => (
+      !product.comboProductIds?.map(String).includes(id) ||
+      typeof label !== 'string' ||
+      !label.trim() ||
+      label.length > 64
+    ))
+  )) return 'Select a valid product pack for every combo item.';
+  if (isComboProduct && product.comboProductIds.some((id) => !product.comboProductVariants?.[String(id)])) {
+    return 'Choose a pack and price for every included product.';
+  }
+  if (!isComboProduct && Object.keys(product.comboProductVariants || {}).length > 0) {
+    return 'Only combo products can have included product pack options.';
+  }
   if (!(Number(product.pricePerUnit) > 0) && !(Array.isArray(product.weights) && product.weights.length > 0)) {
     return 'Add at least one product price.';
   }
@@ -1458,6 +1517,15 @@ const validateComboProductReferences = (product, products, currentProductId = ''
   const selectedProducts = selectedIds.map((id) => products.find((candidate) => String(candidate.id) === id));
   if (selectedProducts.some((candidate) => !candidate || String(candidate.productType || '').trim().toLowerCase() === 'combos')) {
     return 'Combos can only include existing non-combo products.';
+  }
+  for (const selectedProduct of selectedProducts) {
+    const selectedVariantLabel = product.comboProductVariants?.[String(selectedProduct.id)];
+    if (!selectedVariantLabel) {
+      return `Choose a pack for ${selectedProduct.name}.`;
+    }
+    if (selectedVariantLabel && !getComboProductOption(selectedProduct, selectedVariantLabel)) {
+      return `The selected pack is not available for ${selectedProduct.name}.`;
+    }
   }
   return null;
 };
@@ -2131,7 +2199,14 @@ app.post('/api/orders', orderRateLimiter, optionalAuthenticateToken, async (req,
               image: comboProduct.image || '',
               productType: comboProduct.productType || 'Product',
               category: comboProduct.category || '',
-              price: Number(comboProduct.pricePerUnit) || Number(comboProduct.weights?.[0]?.price) || 0,
+              variantLabel: getComboProductOption(
+                comboProduct,
+                product.comboProductVariants?.[String(comboProduct.id)]
+              )?.label || String(comboProduct.quantityType || 'Unit'),
+              price: getComboProductOption(
+                comboProduct,
+                product.comboProductVariants?.[String(comboProduct.id)]
+              )?.price || 0,
               quantity: Number(product.comboProductQuantities?.[String(comboProduct.id)]) || 1,
               unit: getComboProductUnit(comboProduct),
             })),
@@ -3158,11 +3233,11 @@ app.post('/api/admin-profile', requireAdmin, async (req, res) => {
   try {
     const profile = req.body || {};
     if (!isValidSettingsObject(profile) ||
-        (profile.ownerName !== undefined && !isValidName(profile.ownerName, 150)) ||
-        (profile.businessName !== undefined && !isValidName(profile.businessName, 150)) ||
-        (profile.email !== undefined && !isValidEmail(profile.email)) ||
-        (profile.phone !== undefined && !isValidPhone(profile.phone)) ||
-        (profile.whatsapp !== undefined && !isValidPhone(profile.whatsapp)) ||
+        (profile.ownerName !== undefined && (typeof profile.ownerName !== 'string' || (profile.ownerName !== '' && !isValidName(profile.ownerName, 150)))) ||
+        (profile.businessName !== undefined && (typeof profile.businessName !== 'string' || (profile.businessName !== '' && !isValidName(profile.businessName, 150)))) ||
+        (profile.email !== undefined && (profile.email !== '' && !isValidEmail(profile.email))) ||
+        (profile.phone !== undefined && (profile.phone !== '' && !isValidPhone(profile.phone))) ||
+        (profile.whatsapp !== undefined && !isValidWhatsAppContact(profile.whatsapp)) ||
         ['instagram', 'mapLink', 'profileImage', 'logoImage'].some((key) => (
           profile[key] !== undefined && (
             typeof profile[key] !== 'string' || profile[key].length > 2000 ||
