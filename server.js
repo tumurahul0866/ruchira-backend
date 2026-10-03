@@ -3273,6 +3273,23 @@ app.post('/api/product-types', requireAdmin, async (req, res) => {
         new Set(types.map((type) => String(type).trim().toLowerCase())).size !== types.length) {
       return res.status(400).json({ error: 'Enter a valid list of product types.' });
     }
+    const existingTypes = await readProductTypes();
+    const removedTypes = existingTypes.filter((existingType) => (
+      !types.some((type) => type.trim().toLowerCase() === existingType.trim().toLowerCase())
+    ));
+    if (removedTypes.length > 0) {
+      const products = await readProducts();
+      const assignedProduct = products.find((product) => (
+        removedTypes.some((type) => (
+          type.trim().toLowerCase() === String(product.productType || '').trim().toLowerCase()
+        ))
+      ));
+      if (assignedProduct) {
+        return res.status(409).json({
+          error: `Reassign products using "${assignedProduct.productType}" before deleting that product type.`,
+        });
+      }
+    }
     const saved = await writeProductTypes(types);
     res.json(saved);
   } catch {
