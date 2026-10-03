@@ -397,6 +397,7 @@ async function ensureDatabase() {
       id TEXT PRIMARY KEY,
       name TEXT,
       product TEXT,
+      product_ids JSONB,
       rating INTEGER,
       date TEXT,
       text TEXT,
@@ -417,7 +418,8 @@ async function ensureDatabase() {
       ADD COLUMN IF NOT EXISTS user_email TEXT,
       ADD COLUMN IF NOT EXISTS user_name TEXT,
       ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ,
-      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS product_ids JSONB;
   `), 'add review metadata columns');
 
   console.log('DB init: creating offers table');
@@ -936,6 +938,7 @@ async function readReviews() {
       id: row.id,
       name: row.name,
       product: row.product,
+      productIds: parseJsonValue(row.product_ids) || [],
       rating: row.rating,
       date: row.date,
       text: row.text,
@@ -959,12 +962,13 @@ async function writeReviews(nextReviews) {
       await client.query('DELETE FROM reviews');
       for (const review of nextReviews) {
         await client.query(
-          `INSERT INTO reviews (id, name, product, rating, date, text, visible, verified_buyer, user_id, user_email, user_name, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+          `INSERT INTO reviews (id, name, product, product_ids, rating, date, text, visible, verified_buyer, user_id, user_email, user_name, created_at, updated_at)
+           VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
           [
             review.id,
             review.name,
             review.product,
+            JSON.stringify(review.productIds || []),
             review.rating,
             review.date,
             review.text,
@@ -1482,6 +1486,7 @@ const toPublicReview = (review) => ({
   id: String(review?.id || ''),
   name: typeof review?.name === 'string' ? review.name.slice(0, 100) : '',
   product: typeof review?.product === 'string' ? review.product.slice(0, 100) : '',
+  productIds: Array.isArray(review?.productIds) ? review.productIds.map(String) : [],
   rating: Number(review?.rating) || 0,
   date: typeof review?.date === 'string' ? review.date.slice(0, 100) : '',
   text: typeof review?.text === 'string' ? review.text.slice(0, 2000) : '',
@@ -2822,14 +2827,30 @@ app.get('/api/reviews', optionalAuthenticateToken, async (req, res) => {
 app.post('/api/reviews', authenticateToken, async (req, res) => {
   try {
     const review = req.body || {};
-    const product = String(review.product || '').trim();
+    let product = String(review.product || '').trim();
+    const productIds = Array.isArray(review.productIds) ? [...new Set(review.productIds.map(String))] : [];
     const text = String(review.text || '').trim();
     const rating = Number(review.rating);
     const isAdmin = req.user?.isAdmin && await isCurrentAdmin(req.user);
     if (req.user?.isAdmin && !isAdmin) return res.status(403).json({ error: 'Forbidden' });
-    if (!product || product.length > 100) return res.status(400).json({ error: 'Select a valid product before submitting your review.' });
-    if (!isAdmin && product.toLowerCase() !== 'j&d foods' &&
-        !(await readProducts()).some((item) => String(item.name || '').trim().toLowerCase() === product.toLowerCase())) {
+    if ((review.productIds !== undefined && !Array.isArray(review.productIds)) ||
+        productIds.length > 500 ||
+        productIds.some((productId) => !isValidResourceId(productId)) ||
+        (Array.isArray(review.productIds) && productIds.length !== review.productIds.length)) {
+      return res.status(400).json({ error: 'Select valid products for your review.' });
+    }
+    const catalogProducts = !isAdmin && productIds.length > 0 ? await readProducts() : [];
+    if (!isAdmin && productIds.length > 0) {
+      const selectedProducts = productIds.map((productId) => catalogProducts.find(
+        (item) => String(item.id) === productId && item.visible !== false
+      ));
+      if (selectedProducts.some((item) => !item)) {
+        return res.status(400).json({ error: 'Select valid products for your review.' });
+      }
+      product = String(selectedProducts[0].name || '').trim();
+    } else if (!product || product.length > 100 ||
+        (!isAdmin && product.toLowerCase() !== 'j&d foods' &&
+          !(await readProducts()).some((item) => String(item.name || '').trim().toLowerCase() === product.toLowerCase()))) {
       return res.status(400).json({ error: 'Select a valid product before submitting your review.' });
     }
     if (isAdmin && !isValidName(review.name, 100)) return res.status(400).json({ error: 'Enter a valid reviewer name.' });
@@ -2845,10 +2866,17 @@ app.post('/api/reviews', authenticateToken, async (req, res) => {
     const userEmail = req.user.email;
     const userName = isAdmin ? review.name.trim() : (req.user.name || req.user.email);
 
-    const normalizedProduct = product.toLocaleLowerCase();
+    const selectedProductNames = productIds.length > 0
+      ? catalogProducts.filter((item) => productIds.includes(String(item.id)))
+        .map((item) => String(item.name || '').trim().toLocaleLowerCase())
+      : [product.toLocaleLowerCase()];
     const normalizedEmail = String(userEmail || '').toLocaleLowerCase();
     const exists = isAdmin ? null : reviews.find((existingReview) => (
-      String(existingReview.product || '').trim().toLocaleLowerCase() === normalizedProduct &&
+      (
+        (Array.isArray(existingReview.productIds) &&
+          existingReview.productIds.some((productId) => productIds.includes(String(productId)))) ||
+        selectedProductNames.includes(String(existingReview.product || '').trim().toLocaleLowerCase())
+      ) &&
       (
         (userId && String(existingReview.user_id || '') === String(userId)) ||
         (normalizedEmail && String(existingReview.user_email || '').toLocaleLowerCase() === normalizedEmail)
@@ -2869,6 +2897,7 @@ app.post('/api/reviews', authenticateToken, async (req, res) => {
       id: crypto.randomUUID(),
       name: userName,
       product,
+      ...(productIds.length > 0 ? { productIds } : {}),
       rating,
       date: now,
       visible: true,
@@ -2881,12 +2910,13 @@ app.post('/api/reviews', authenticateToken, async (req, res) => {
 
     if (isPostgresEnabled && pool) {
       await pool.query(
-        `INSERT INTO reviews (id, name, product, rating, date, text, visible, verified_buyer, user_id, user_email, user_name, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+        `INSERT INTO reviews (id, name, product, product_ids, rating, date, text, visible, verified_buyer, user_id, user_email, user_name, created_at, updated_at)
+         VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
         [
           nextReview.id,
           nextReview.name,
           nextReview.product,
+          JSON.stringify(nextReview.productIds || []),
           nextReview.rating,
           nextReview.date,
           nextReview.text,
